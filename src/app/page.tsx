@@ -430,7 +430,7 @@ export default function Home() {
 
               setTracks(allTracks);
               setAudioUrl(allTracks[0]?.url || statusData.audioUrl);
-              setSongTitle(statusData.title || null);
+              setSongTitle(typeof (statusData as any).title === 'string' ? (statusData as any).title as string : null);
               setActiveTrackIndex(0);
               setStatus('completed');
               setProgress(100);

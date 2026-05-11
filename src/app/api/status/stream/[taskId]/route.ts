@@ -107,8 +107,6 @@ export async function GET(
     async start(controller) {
       const encoder = new TextEncoder();
       const send = (data: unknown, event?: string) => {
-        if (controller.signal.aborted) return;
-
         try {
           controller.enqueue(encoder.encode(formatSseMessage(data, event)));
         } catch {
