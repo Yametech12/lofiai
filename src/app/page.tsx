@@ -455,7 +455,7 @@ export default function Home() {
                 prompt,
                 musicStyle,
                 makeInstrumental,
-                title: statusData.title || null,
+                title: typeof (statusData as any).title === 'string' ? ((statusData as any).title as string) : null,
                 tracks: allTracks,
                 createdAt: Date.now(),
               });
@@ -466,7 +466,7 @@ export default function Home() {
             } else if (statusData.status === 'failed') {
               clearInterval(sseTimer);
               clearPoll();
-              throw new Error(statusData.error || 'Generation failed');
+              throw new Error(typeof (statusData as any).error === 'string' ? ((statusData as any).error as string) : 'Generation failed');
             } else {
               // Processing
               const msg = statusData.message || 'Processing your request...';
