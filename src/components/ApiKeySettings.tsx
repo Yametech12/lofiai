@@ -44,6 +44,7 @@ export default function ApiKeySettings({ onApiKeyChange }: ApiKeySettingsProps) 
   return (
     <div className="border-t border-gray-800 pt-4 mt-4">
       <button
+        type="button"
         onClick={() => setIsExpanded(!isExpanded)}
         className="flex items-center justify-between w-full px-4 py-3 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors"
       >
@@ -88,23 +89,25 @@ export default function ApiKeySettings({ onApiKeyChange }: ApiKeySettingsProps) 
             </p>
           </div>
 
-          <div className="flex gap-2">
-            <button
-              onClick={handleSaveApiKey}
-              disabled={!apiKey.trim()}
-              className="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
-            >
-              {isSaved ? '✓ Saved' : 'Save API Key'}
-            </button>
-            {hasApiKey && (
-              <button
-                onClick={handleClearApiKey}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-medium transition-colors"
-              >
-                Clear
-              </button>
-            )}
-          </div>
+           <div className="flex gap-2">
+             <button
+               type="button"
+               onClick={handleSaveApiKey}
+               disabled={!apiKey.trim()}
+               className="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
+             >
+               {isSaved ? '✓ Saved' : 'Save API Key'}
+             </button>
+             {hasApiKey && (
+               <button
+                 type="button"
+                 onClick={handleClearApiKey}
+                 className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-medium transition-colors"
+               >
+                 Clear
+               </button>
+             )}
+           </div>
 
           <div className="bg-blue-900/20 border border-blue-800 rounded-lg p-3 text-sm text-blue-300">
             <div className="font-semibold mb-1">💡 How it works:</div>
