@@ -229,9 +229,10 @@ export default function Home() {
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [pollAttempts, setPollAttempts] = useState(0);
   const msgIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const sseStartTimeRef = useRef<number | null>(null);
-  const cancelSseRef = useRef<(() => void) | null>(null);
+   const eventSourceRef = useRef<EventSource | null>(null);
+   const sseStartTimeRef = useRef<number | null>(null);
+   const cancelSseRef = useRef<(() => void) | null>(null);
+   const generationCompleteRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement>(null);
 
    const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -242,39 +243,53 @@ export default function Home() {
    const audioContextRef = useRef<AudioContext | null>(null);
    const gainNodeRef = useRef<GainNode | null>(null);
 
-  // Animation loop
-  useEffect(() => {
-    if (!isPlaying || !analyserRef.current) return;
-    const canvas = visualizationRef.current;
-    if (!canvas) return;
-    const canvasCtx = canvas.getContext('2d');
-    if (!canvasCtx) return;
-    const WIDTH = canvas.width;
-    const HEIGHT = canvas.height;
-    const bufferLength = analyserRef.current.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
+   // Animation loop - wrapped to prevent CORS/security errors
+   useEffect(() => {
+     if (!isPlaying || !analyserRef.current) return;
+     const canvas = visualizationRef.current;
+     if (!canvas) return;
+     const canvasCtx = canvas.getContext('2d');
+     if (!canvasCtx) return;
+     const WIDTH = canvas.width;
+     const HEIGHT = canvas.height;
+     const bufferLength = analyserRef.current.frequencyBinCount;
+     const dataArray = new Uint8Array(bufferLength);
 
-    const draw = () => {
-      if (!analyserRef.current || !isPlaying) return;
+     let animationFrameId: number;
 
-      requestAnimationFrame(draw);
+     const draw = () => {
+       if (!analyserRef.current || !isPlaying) return;
 
-      analyserRef.current.getByteFrequencyData(dataArray);
-      canvasCtx.clearRect(0, 0, WIDTH, HEIGHT);
+       animationFrameId = requestAnimationFrame(draw);
 
-      const barWidth = WIDTH / bufferLength / 2.5;
-      let x = 0;
+       try {
+         analyserRef.current.getByteFrequencyData(dataArray);
+       } catch (error) {
+         // CORS or decoding error - stop visualization silently
+         console.debug('Visualization error (CORS or decode):', error);
+         cancelAnimationFrame(animationFrameId);
+         return;
+       }
 
-      for (let i = 0; i < bufferLength; i++) {
-        const barHeight = (dataArray[i] / 255) * HEIGHT;
-        canvasCtx.fillStyle = `hsl(${i * 1.2}, 70%, 50%)`;
-        canvasCtx.fillRect(x, HEIGHT - barHeight, barWidth, barHeight);
-        x += barWidth * 1.5;
-      }
-    };
+       canvasCtx.clearRect(0, 0, WIDTH, HEIGHT);
 
-    draw();
-  }, [isPlaying, trackDuration]);
+       const barWidth = WIDTH / bufferLength / 2.5;
+       let x = 0;
+
+       for (let i = 0; i < bufferLength; i++) {
+         const barHeight = (dataArray[i] / 255) * HEIGHT;
+         canvasCtx.fillStyle = `hsl(${i * 1.2}, 70%, 50%)`;
+         canvasCtx.fillRect(x, HEIGHT - barHeight, barWidth, barHeight);
+         x += barWidth * 1.5;
+       }
+     };
+
+     draw();
+
+     return () => {
+       cancelAnimationFrame(animationFrameId);
+     };
+   }, [isPlaying, trackDuration]);
 
   // Keep progress bar fill width in sync without JSX inline styles
   useEffect(() => {
@@ -403,6 +418,16 @@ export default function Home() {
   }, [volume]);
 
   const clearPoll = useCallback(() => {
+    // Close SSE stream if active - clear onerror first to prevent spurious error handler
+    if (eventSourceRef.current) {
+      try {
+        eventSourceRef.current.onerror = null;
+        eventSourceRef.current.close();
+      } catch {}
+      eventSourceRef.current = null;
+    }
+
+    // Clear polling intervals
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
@@ -412,24 +437,10 @@ export default function Home() {
       msgIntervalRef.current = null;
     }
 
-    // Close SSE stream if active
-    if (eventSourceRef.current) {
-      try {
-        eventSourceRef.current.close();
-      } catch {}
-      eventSourceRef.current = null;
-    }
-
     // Cancel any in-flight handlers
     cancelSseRef.current?.();
     cancelSseRef.current = null;
     sseStartTimeRef.current = null;
-
-    setPollAttempts(0);
-    audioContextRef.current?.close();
-    audioContextRef.current = null;
-    analyserRef.current = null;
-    gainNodeRef.current = null;
   }, []);
 
 
@@ -478,7 +489,9 @@ export default function Home() {
     setCurrentTime(0);
     setTrackDuration(0);
     setShouldRefreshAudioKey((v) => !v);
+    setUpgradeAvailable(false);
     setIsPreview(outputLength === '15');
+    generationCompleteRef.current = false; // reset completion flag
 
     try {
       const response = await fetch('/api/generate', {
@@ -566,6 +579,9 @@ export default function Home() {
               setCurrentTime(0);
               setTrackDuration(0);
 
+              // Mark generation as complete to ignore subsequent SSE errors
+              generationCompleteRef.current = true;
+
               fetch('/api/credits')
                 .then((r) => r.json())
                 .then((d) => {
@@ -628,6 +644,12 @@ export default function Home() {
         };
 
         const onError = () => {
+          // If generation already completed successfully, ignore this error
+          // (EventSource fires onerror when connection closes after we call close())
+          if (generationCompleteRef.current) {
+            return;
+          }
+
           clearInterval(sseTimer);
           clearPoll();
           setShowErrorBanner(true);
@@ -1465,52 +1487,55 @@ export default function Home() {
                         </p>
                       </div>
 
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => {
-                            setUpgradeAvailable(false);
-                            setOutputLength('60');
-                            handleGenerate();
-                          }}
-                          className="inline-flex items-center gap-2 px-4 py-2 bg-cyan-600/80 hover:bg-cyan-500 border border-cyan-500/50 rounded-lg text-sm font-medium text-white transition-all hover:scale-105 active:scale-95 shadow-lg shadow-cyan-900/50"
-                        >
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                          </svg>
-                          Upgrade (${estimateCost(1, '60').toFixed(2)})
-                        </button>
-                        <button
-                          onClick={() => setUpgradeAvailable(false)}
-                          className="px-3 py-2 rounded-lg bg-gray-800/50 hover:bg-gray-700 border border-gray-600 text-gray-300 hover:text-white transition-colors"
-                          aria-label="Dismiss upgrade offer"
-                        >
-                          Dismiss
-                        </button>
-                      </div>
+                       <div className="flex gap-2">
+                         <button
+                           onClick={() => {
+                             setUpgradeAvailable(false);
+                             setOutputLength('60');
+                             // Defer generation to allow state update to take effect
+                             setTimeout(() => handleGenerate(), 50);
+                           }}
+                           className="inline-flex items-center gap-2 px-4 py-2 bg-cyan-600/80 hover:bg-cyan-500 border border-cyan-500/50 rounded-lg text-sm font-medium text-white transition-all hover:scale-105 active:scale-95 shadow-lg shadow-cyan-900/50"
+                         >
+                           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                           </svg>
+                           Upgrade (${estimateCost(1, '60').toFixed(2)})
+                         </button>
+                         <button
+                           onClick={() => setUpgradeAvailable(false)}
+                           className="px-3 py-2 rounded-lg bg-gray-800/50 hover:bg-gray-700 border border-gray-600 text-gray-300 hover:text-white transition-colors"
+                           aria-label="Dismiss upgrade offer"
+                         >
+                           Dismiss
+                         </button>
+                       </div>
                     </div>
                   </div>
                 )}
 
                {/* Enhanced Audio Player */}
                <div className="space-y-4">
-                {/* Hidden audio element with key trigger to force re-mount and sync */}
-                <audio
-                  ref={audioRef}
-                  key={audioUrl + (shouldRefreshAudioKey ? '_reset' : '')}
-                  controls
-                  className="hidden"
-                  src={audioUrl}
-                  preload="metadata"
-                  onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-                  onLoadedMetadata={(e) => setTrackDuration(e.currentTarget.duration)}
-                  onEnded={() => setIsPlaying(false)}
-                  onPlay={() => setIsPlaying(true)}
-                  onPause={() => setIsPlaying(false)}
-                  onError={() => {
-                    setError('Failed to load audio');
-                    setShowErrorBanner(true);
-                  }}
-                />
+                 {/* Hidden audio element with key trigger to force re-mount and sync */}
+                 <audio
+                   ref={audioRef}
+                   key={audioUrl + (shouldRefreshAudioKey ? '_reset' : '')}
+                   controls
+                   className="hidden"
+                   src={audioUrl}
+                   crossOrigin="anonymous"
+                   preload="metadata"
+                   onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+                   onLoadedMetadata={(e) => setTrackDuration(e.currentTarget.duration)}
+                   onEnded={() => setIsPlaying(false)}
+                   onPlay={() => setIsPlaying(true)}
+                   onPause={() => setIsPlaying(false)}
+                   onError={() => {
+                     console.error('Audio load error for URL:', audioUrl);
+                     setError('Failed to load audio. The file may be unavailable or CORS-restricted.');
+                     setShowErrorBanner(true);
+                   }}
+                 />
 
                  {/* Player Controls */}
                  <div className="bg-gray-800/40 backdrop-blur-sm rounded-xl p-4 space-y-3 border border-gray-700/50">
