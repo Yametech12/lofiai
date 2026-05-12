@@ -983,69 +983,22 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Cost Estimator */}
-            {!isWorking && (
-              <div className="flex items-center justify-between p-3 bg-gradient-to-r from-gray-800/40 to-gray-900/40 rounded-lg border border-gray-700/50">
-                <div className="flex flex-col">
-                  <span className="text-xs text-gray-400">Estimated cost</span>
-                  <span className="text-[10px] text-gray-500">
-                    ~{outputLength === '15' ? '15' : outputLength === '30' ? '30' : '60'}s × {numOutputs} {numOutputs === 1 ? 'track' : 'tracks'}
-                  </span>
-                </div>
-                <div className="text-right">
-                  <div className="text-lg font-bold text-cyan-400">
-                    ${estimateCost(numOutputs, outputLength).toFixed(2)}
-                  </div>
-                </div>
-              </div>
-            )}
-          <div className="text-right">
-             <button
-               onClick={() => {
-                 const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
-                 fetch(url)
-                   .then((r) => r.json())
-                   .then((d) => {
-                    if (d.credits != null) {
-                      setCredits(d.credits);
-                      setCreditsLoadFailed(false);
-                    } else {
-                      setCreditsLoadFailed(true);
-                    }
-                  })
-                  .catch(() => setCreditsLoadFailed(true));
-               }}
-               className={`
-                 relative inline-flex items-center gap-1.5 px-3 py-2 rounded-xl transition-all
-                 ${creditsLow 
-                   ? 'bg-red-900/30 border-2 border-red-500/60 hover:border-red-400/80 shadow-lg shadow-red-900/50' 
-                   : 'bg-gray-900/80 border border-gray-700 hover:border-cyan-500/50'
-                 }
-               `}
-               title="Click to refresh credits"
-             >
-               {creditsLow && (
-                 <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full pulse-ring" />
-               )}
-               <svg className={`w-4 h-4 ${creditsLow ? 'text-red-400' : 'text-cyan-400'}`} fill="currentColor" viewBox="0 0 24 24">
-                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
-               </svg>
-               <span className={`text-sm font-medium ${creditsLow ? 'text-red-300' : 'text-cyan-400'}`}>
-                 {creditsDisplay}
-               </span>
-             </button>
-            {creditsLow && (
-              <p className="text-xs text-red-500 mt-1">Low balance</p>
-            )}
-            {history.length > 0 && (
-              <button
-                onClick={() => setShowHistory((v) => !v)}
-                className="mt-1.5 w-full text-xs text-gray-500 hover:text-gray-300 transition-colors"
-              >
-                {showHistory ? 'Hide' : 'Show'} history
-              </button>
-            )}
-          </div>
+             {/* Cost Estimator */}
+             {!isWorking && (
+               <div className="flex items-center justify-between p-3 bg-gradient-to-r from-gray-800/40 to-gray-900/40 rounded-lg border border-gray-700/50">
+                 <div className="flex flex-col">
+                   <span className="text-xs text-gray-400">Estimated cost</span>
+                   <span className="text-[10px] text-gray-500">
+                     ~{outputLength === '15' ? '15' : outputLength === '30' ? '30' : '60'}s × {numOutputs} {numOutputs === 1 ? 'track' : 'tracks'}
+                   </span>
+                 </div>
+                 <div className="text-right">
+                   <div className="text-lg font-bold text-cyan-400">
+                     ${estimateCost(numOutputs, outputLength).toFixed(2)}
+                   </div>
+                 </div>
+               </div>
+             )}
         </div>
 
         {/* Error Banner - Enhanced */}
