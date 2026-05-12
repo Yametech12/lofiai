@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import apiKeyManager from '../utils/apiKeyManager';
 
 const MUSICGPT_API_URL = 'https://api.musicgpt.com/api/public/v1/MusicAI';
 
@@ -52,8 +51,8 @@ async function sendGenerationRequest(
       ...(vocal_only !== undefined && { vocal_only }),
       ...(voice_id && { voice_id }),
       ...(webhook_url && { webhook_url }),
-      ...(output_length && { output_length }),
-      ...(num_outputs && { num_outputs }),
+      ...(output_length && { output_length: output_length === '15' ? '15' : output_length === '60' ? '60' : '30' }),
+      ...(num_outputs && { num_outputs: Math.min(4, Math.max(1, parseInt(num_outputs, 10))) }),
     }),
     signal: AbortSignal.timeout(30_000),
   });
@@ -93,139 +92,75 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Prompt is required' }, { status: 400 });
     }
 
-    // Use user's API key if provided; otherwise fall back to server keys via apiKeyManager.
     const userKey = userApiKey?.trim() || null;
-    const serverKeys = apiKeyManager.getValidKeys();
 
-    if (!userKey && serverKeys.length === 0) {
+    if (!userKey) {
       return NextResponse.json(
-        { error: 'MusicGPT API key not configured (set MUSICGPT_API_KEY or MUSICGPT_API_KEYS_BACKUP).' },
+        { error: 'MusicGPT API key missing. Add your key in the web UI (settings panel).' },
         { status: 401 }
       );
     }
 
-    // If user provided a key, try it once (and map auth/credits errors).
-    if (userKey) {
-      try {
-        const data = await sendGenerationRequest(
-          userKey,
-          prompt,
-          music_style,
-          lyrics,
-          make_instrumental,
-          vocal_only,
-          voice_id,
-          webhook_url,
-          output_length,
-          num_outputs
+    try {
+      const data = await sendGenerationRequest(
+        userKey,
+        prompt,
+        music_style,
+        lyrics,
+        make_instrumental,
+        vocal_only,
+        voice_id,
+        webhook_url,
+        output_length,
+        num_outputs
+      );
+
+      const taskId = data.task_id;
+      if (!taskId) {
+        console.error('No task_id in MusicGPT response:', data);
+        return NextResponse.json(
+          { error: 'Invalid response from MusicGPT API', details: data },
+          { status: 502 }
         );
-
-        const taskId = data.task_id;
-        if (!taskId) {
-          console.error('No task_id in MusicGPT response:', data);
-          return NextResponse.json(
-            { error: 'Invalid response from MusicGPT API', details: data },
-            { status: 502 }
-          );
-        }
-
-        return NextResponse.json({
-          taskId,
-          conversionId: data.conversion_id_1 || null,
-          eta: data.eta || null,
-          creditEstimate: data.credit_estimate || null,
-        });
-      } catch (error: unknown) {
-        if (error instanceof Error && error.name === 'TimeoutError') {
-          return NextResponse.json({ error: 'Request timed out. Please try again.' }, { status: 504 });
-        }
-
-        const errorObj = error as { status?: number; message?: string; data?: unknown };
-
-        if (errorObj.status === 401) {
-          return NextResponse.json(
-            { error: 'Invalid API key. Please check your MusicGPT API key in settings.' },
-            { status: 401 }
-          );
-        }
-
-        if (errorObj.status === 402) {
-          return NextResponse.json(
-            { error: 'Insufficient credits. Please check your MusicGPT account.' },
-            { status: 402 }
-          );
-        }
-
-        if (errorObj.status === 429) {
-          return NextResponse.json(
-            { error: 'MusicGPT rate limit hit. Please wait and try again.' },
-            { status: 429 }
-          );
-        }
-
-        console.error('Error in generate API (user key):', error);
-        return NextResponse.json({ error: errorObj.message || 'Internal server error' }, { status: 500 });
       }
-    }
 
-    // Otherwise, try each server key until one succeeds.
-    let lastError: { status?: number; message?: string } | null = null;
+      return NextResponse.json({
+        taskId,
+        conversionId: data.conversion_id_1 || null,
+        eta: data.eta || null,
+        creditEstimate: data.credit_estimate || null,
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === 'TimeoutError') {
+        return NextResponse.json({ error: 'Request timed out. Please try again.' }, { status: 504 });
+      }
 
-    for (const serverKey of serverKeys) {
-      try {
-        const data = await sendGenerationRequest(
-          serverKey,
-          prompt,
-          music_style,
-          lyrics,
-          make_instrumental,
-          vocal_only,
-          voice_id,
-          webhook_url,
-          output_length,
-          num_outputs
+      const errorObj = error as { status?: number; message?: string; data?: unknown };
+
+      if (errorObj.status === 401) {
+        return NextResponse.json(
+          { error: 'Invalid API key. Please check your MusicGPT API key in settings.' },
+          { status: 401 }
         );
-
-        const taskId = data.task_id;
-        if (!taskId) {
-          console.error('No task_id in MusicGPT response:', data);
-          return NextResponse.json(
-            { error: 'Invalid response from MusicGPT API', details: data },
-            { status: 502 }
-          );
-        }
-
-        return NextResponse.json({
-          taskId,
-          conversionId: data.conversion_id_1 || null,
-          eta: data.eta || null,
-          creditEstimate: data.credit_estimate || null,
-        });
-      } catch (error: unknown) {
-        const errorObj = error as { status?: number; message?: string };
-        lastError = errorObj;
-
-        // Mark unusable keys invalid and continue.
-        if (errorObj.status === 401 || errorObj.status === 403 || errorObj.status === 429) {
-          apiKeyManager.markKeyInvalid(serverKey);
-          continue;
-        }
-
-        if (errorObj.status === 402) {
-          return NextResponse.json(
-            { error: 'Insufficient credits. Please check your MusicGPT account.' },
-            { status: 402 }
-          );
-        }
-
-        // Non-auth failures: break and surface.
-        break;
       }
-    }
 
-    const status = lastError?.status || 500;
-    const message = lastError?.message || 'Internal server error';
-    return NextResponse.json({ error: message }, { status });
+      if (errorObj.status === 402) {
+        return NextResponse.json(
+          { error: 'Insufficient credits. Please check your MusicGPT account.' },
+          { status: 402 }
+        );
+      }
+
+      if (errorObj.status === 429) {
+        return NextResponse.json(
+          { error: 'MusicGPT rate limit hit. Please wait and try again.' },
+          { status: 429 }
+        );
+      }
+
+      console.error('Error in generate API (user key):', error);
+      return NextResponse.json({ error: errorObj.message || 'Internal server error' }, { status: 500 });
+    }
   } catch (error) {
 
     console.error('Error parsing request:', error);

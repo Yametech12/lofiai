@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import apiKeyManager from '../../../utils/apiKeyManager';
 
 const MUSICGPT_STATUS_URL = 'https://api.musicgpt.com/api/public/v1/byId';
 
@@ -114,20 +113,18 @@ export async function GET(
         }
       };
 
-
       // SSE headers are set via NextResponse below.
       send({ status: 'processing', progress: 0, message: 'Starting stream...' });
 
       const abort = new AbortController();
       const intervalMs = 2000;
 
-      const sendFinalAndClose = (data: unknown) => {
-        send(data, 'done');
-        try {
-          controller.close();
-        } catch {}
-        abort.abort();
-      };
+  const sendFinalAndClose = (data: unknown) => {
+    // Use default 'message' event so client's EventSource listener receives it
+    send(data);
+    try { controller.close(); } catch {}
+    abort.abort();
+  };
 
       const pollOnce = async () => {
         try {
@@ -178,81 +175,10 @@ export async function GET(
             return;
           }
 
-          // Server key path
-          const validKeys = apiKeyManager.getValidKeys();
-          if (!validKeys.length) {
-            sendFinalAndClose({
-              status: 'failed',
-              progress: 0,
-              error: 'MusicGPT API key not configured or all keys invalid',
-            });
-            return;
-          }
-
-          let lastError: { status?: number; message?: string } | null = null;
-
-          for (const key of validKeys) {
-            try {
-              const data = await fetchStatusWithKey(key, taskId);
-              if (!data?.success) {
-                sendFinalAndClose(buildFailed(data?.message || data?.error));
-                return;
-              }
-
-              const conversion = data.conversion;
-              if (!conversion) {
-                sendFinalAndClose(buildFailed('No conversion data returned'));
-                return;
-              }
-
-              const currentStatus = conversion.status || 'PROCESSING';
-              const tracks = mapConversionToTracks(conversion);
-              const audioUrl = tracks[0]?.url || null;
-
-              const isCompleted = currentStatus === 'COMPLETED' || !!audioUrl;
-              const isFailed = currentStatus === 'FAILED' || currentStatus === 'ERROR';
-
-              if (isCompleted) {
-                sendFinalAndClose({
-                  status: 'completed',
-                  progress: 100,
-                  audioUrl,
-                  title: tracks[0]?.title || conversion.title_1 || conversion.title_2 || null,
-                  music_style: conversion.music_style || null,
-                  tracks,
-                });
-                return;
-              }
-
-              if (isFailed) {
-                sendFinalAndClose(buildFailed(conversion.status_msg));
-                return;
-              }
-
-              send({
-                status: 'processing',
-                progress: 50,
-                message: conversion.status_msg || 'Processing...',
-              });
-              return;
-            } catch (error: unknown) {
-              const err = error as { status?: number; message?: string };
-              lastError = err;
-
-              if (err?.status === 401 || err?.status === 403 || err?.status === 429) {
-                apiKeyManager.markKeyInvalid(key);
-                continue;
-              }
-
-              // Non-auth failures: surface after loop
-              break;
-            }
-          }
-
           sendFinalAndClose({
             status: 'failed',
             progress: 0,
-            error: lastError?.message || 'Internal server error',
+            error: 'MusicGPT API key missing. Add your key in the web UI (settings panel).',
           });
         } catch (error: unknown) {
           const err = error as { status?: number; message?: string };
@@ -295,4 +221,3 @@ export async function GET(
     },
   });
 }
-

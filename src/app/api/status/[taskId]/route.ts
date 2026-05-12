@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import apiKeyManager from '../../utils/apiKeyManager';
 
 const MUSICGPT_STATUS_URL = 'https://api.musicgpt.com/api/public/v1/byId';
 
@@ -186,94 +185,10 @@ export async function GET(
       }
     }
 
-    // Fall back to server keys if no user key provided
-    const validKeys = apiKeyManager.getValidKeys();
-    if (!validKeys.length) {
-      return NextResponse.json(
-        { error: 'MusicGPT API key not configured or all keys invalid' },
-        { status: 500 }
-      );
-    }
-
-    let lastError: { status?: number; message?: string } | null = null;
-
-
-    // Try each valid key until one succeeds.
-    for (const key of validKeys) {
-      try {
-        const data = await fetchStatusWithKey(key, taskId);
-
-        if (!data?.success) {
-          // MusicGPT returned a response but indicated failure.
-          return NextResponse.json(
-            {
-              status: 'failed',
-              progress: 0,
-              error: data?.message || data?.error || 'Generation failed',
-            },
-            { status: 200 }
-          );
-        }
-
-        const conversion = data.conversion;
-        if (!conversion) {
-          return NextResponse.json(
-            {
-              status: 'failed',
-              progress: 0,
-              error: 'No conversion data returned',
-            },
-            { status: 200 }
-          );
-        }
-
-        const currentStatus = conversion.status || 'PROCESSING';
-        const tracks = mapConversionToTracks(conversion);
-        const audioUrl = tracks[0]?.url || null;
-
-        const isCompleted = currentStatus === 'COMPLETED' || !!audioUrl;
-        const isFailed = currentStatus === 'FAILED' || currentStatus === 'ERROR';
-
-        if (isCompleted) {
-          return NextResponse.json({
-            status: 'completed',
-            progress: 100,
-            audioUrl,
-            title: tracks[0]?.title || conversion.title_1 || conversion.title_2 || null,
-            music_style: conversion.music_style || null,
-            tracks: tracks,
-          });
-        }
-
-        if (isFailed) {
-          return NextResponse.json(buildFailed(conversion.status_msg), { status: 200 });
-        }
-
-        return NextResponse.json({
-          status: 'processing',
-          progress: 50,
-          message: conversion.status_msg || 'Processing...',
-        });
-      } catch (error: unknown) {
-        lastError = error as { status?: number; message?: string };
-
-        const err = error as { status?: number; message?: string };
-
-
-        // If this key is auth/permission/rate-limited, mark it invalid and continue.
-        if (err?.status === 401 || err?.status === 403 || err?.status === 429) {
-          apiKeyManager.markKeyInvalid(key);
-          continue;
-        }
-
-        // Non-auth failures: break and surface the error.
-        break;
-      }
-    }
-
-    const status = lastError?.status || 500;
-    const message = lastError?.message || 'Internal server error';
-    return NextResponse.json({ error: message }, { status });
+    return NextResponse.json(
+      { status: 'failed', progress: 0, error: 'MusicGPT API key missing. Add your key in the web UI.' },
+      { status: 200 }
+    );
   } catch (error: unknown) {
     if (error instanceof Error && error.name === 'TimeoutError') {
       return NextResponse.json({ error: 'Request timed out. Please try again.' }, { status: 504 });

@@ -6,7 +6,7 @@ import ApiKeySettings from '@/components/ApiKeySettings';
 type GenerationStatus = 'idle' | 'generating' | 'polling' | 'completed' | 'error';
 
 interface Track {
-  url: string;
+  url: string | null;
   wavUrl: string | null;
   title: string | null;
   duration: number | null;
@@ -35,6 +35,20 @@ const FEATURED_PROMPTS = [
   { label: '🌙 Midnight Dream', prompt: 'Floating through a midnight dreamscape with ethereal synths, soft trap hats, and warm pads', style: 'Dreamy Lo-Fi' },
 ];
 
+// Prompt auto-expansion templates
+const PROMPT_TEMPLATES: Record<string, string> = {
+  rainy: 'rainy night in Tokyo, vinyl crackle, mellow piano chords, soft boom-bap drums, lo-fi aesthetic, 75 BPM',
+  night: 'late night cityscape, ambient synth pads, gentle rainfall, warm vinyl warmth, dreamy atmosphere',
+  coffee: 'cozy coffee shop ambience, fingerstyle guitar, subtle cup clinks, warm sunlight, relaxed mood',
+  study: 'late night study session, soft ambient pads, gentle rain sounds, warm bass tones, focused energy',
+  jazz: 'smooth jazz café, upright bass, brush drums, Rhodes piano, intimate room ambience',
+  drive: 'nostalgic highway drive, dreamy synth leads, slow trap hats, rain on windshield, sunset glow',
+  ocean: 'ocean waves washing ashore, ukulele strums, sea breeze ambience, tropical lofi rhythm',
+  urban: 'urban twilight cityscape, neon light reflections, calm lo-fi beats, distant traffic hum',
+  piano: 'solo piano lofi, soft key presses, room ambience, warm tape saturation, peaceful mood',
+  guitar: 'acoustic guitar fingerstyle, warm bedside recording, vinyl crackle, gentle strums, cozy vibe',
+};
+
 const STYLE_SUGGESTIONS = [
   'Lo-Fi Hip Hop', 'Lo-Fi Chill', 'Ambient Lo-Fi', 'Jazz Lo-Fi',
   'Synthwave Lo-Fi', 'Chillhop', 'Dreamy Lo-Fi', 'Vaporwave',
@@ -46,6 +60,18 @@ const POLL_INTERVAL_MS = 2000;
 const HISTORY_KEY = 'ghostname_history';
 const MAX_HISTORY = 5;
 const LOW_CREDITS_THRESHOLD = 1.0;
+
+// Credit cost estimates per second (rough approximation)
+const CREDITS_PER_SECOND = {
+  '15': 0.0053,  // ~$0.08 for 15s
+  '30': 0.005,   // ~$0.15 for 30s
+  '60': 0.0047,  // ~$0.28 for 60s
+};
+
+function estimateCost(numOutputs: number, duration: string): number {
+  const base = CREDITS_PER_SECOND[duration as keyof typeof CREDITS_PER_SECOND] || 0.005;
+  return Math.round((numOutputs * base * 100) / 100);
+}
 
 function formatDuration(secs: number | null): string {
   if (!secs || isNaN(secs)) return '0:00';
@@ -118,6 +144,8 @@ export default function Home() {
   const [prompt, setPrompt] = useState('');
   const [musicStyle, setMusicStyle] = useState('');
   const [makeInstrumental, setMakeInstrumental] = useState(false);
+  const [numOutputs, setNumOutputs] = useState(1);
+  const [outputLength, setOutputLength] = useState('30');
   const [userApiKey, setUserApiKey] = useState<string | null>(null);
   const [status, setStatus] = useState<GenerationStatus>('idle');
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -160,13 +188,43 @@ export default function Home() {
     }
   }, []);
 
-  const [currentTime, setCurrentTime] = useState(0);
-  const [trackDuration, setTrackDuration] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [volume, setVolume] = useState(1);
-  const [showErrorBanner, setShowErrorBanner] = useState(false);
-  const [shouldRefreshAudioKey, setShouldRefreshAudioKey] = useState(false);
-  const [isLooping, setIsLooping] = useState(false);
+   const [currentTime, setCurrentTime] = useState(0);
+   const [trackDuration, setTrackDuration] = useState(0);
+   const [isPlaying, setIsPlaying] = useState(false);
+   const [volume, setVolume] = useState(1);
+   const [showErrorBanner, setShowErrorBanner] = useState(false);
+   const [errorDetails, setErrorDetails] = useState<string | null>(null);
+   const [shouldRefreshAudioKey, setShouldRefreshAudioKey] = useState(false);
+   const [isLooping, setIsLooping] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const [hasInteracted, setHasInteracted] = useState(false);
+  const [isPreview, setIsPreview] = useState(false);
+  const [upgradeAvailable, setUpgradeAvailable] = useState(false);
+
+    // Auto-dismiss errors after 8 seconds
+    useEffect(() => {
+      if (error && showErrorBanner) {
+        const timer = setTimeout(() => {
+          setShowErrorBanner(false);
+          setErrorDetails(null);
+        }, 8000);
+        return () => clearTimeout(timer);
+      }
+     }, [error, showErrorBanner]);
+
+    // Warn before leaving if generation in progress
+   useEffect(() => {
+     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+       if (status === 'polling' || status === 'generating') {
+         const message = 'A track is currently generating. Are you sure you want to leave?';
+         e.returnValue = message;
+         return message;
+       }
+     };
+
+     window.addEventListener('beforeunload', handleBeforeUnload);
+     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+   }, [status]);
 
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [pollAttempts, setPollAttempts] = useState(0);
@@ -254,43 +312,85 @@ export default function Home() {
   }, [userApiKey]);
 
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-      if (msgIntervalRef.current) clearInterval(msgIntervalRef.current);
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-    };
-  }, []);
+    // Cleanup on unmount - place after clearPoll definition to avoid forward ref
+    useEffect(() => {
+      return () => {
+        // Clear polling intervals
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
+        }
+        if (msgIntervalRef.current) {
+          clearInterval(msgIntervalRef.current);
+          msgIntervalRef.current = null;
+        }
 
-  // Audio Web API setup
-  useEffect(() => {
-    if (typeof window === 'undefined' || !audioRef.current) return;
+        // Close SSE stream if active
+        if (eventSourceRef.current) {
+          try {
+            eventSourceRef.current.close();
+          } catch {}
+          eventSourceRef.current = null;
+        }
 
-    const AudioContextClass = window.AudioContext || ((window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext);
-    const ctx = new AudioContextClass();
-    const analyser = ctx.createAnalyser();
-    const source = ctx.createMediaElementSource(audioRef.current);
-    const gainNode = ctx.createGain();
+        // Cancel any in-flight handlers
+        cancelSseRef.current?.();
+        cancelSseRef.current = null;
+        sseStartTimeRef.current = null;
 
-    analyser.fftSize = 512;
-    source.connect(analyser);
-    analyser.connect(gainNode);
-    gainNode.connect(ctx.destination);
+        // Close audio context
+        if (audioContextRef.current) {
+          audioContextRef.current.close();
+        }
+      };
+    }, []);
 
-    audioContextRef.current = ctx;
-    analyserRef.current = analyser;
-    gainNodeRef.current = gainNode;
+   // Audio Web API setup - wrapped to prevent crashes from CORS or browser issues
+   useEffect(() => {
+     if (typeof window === 'undefined' || !audioRef.current) return;
 
-    return () => {
-      audioContextRef.current?.close();
-      audioContextRef.current = null;
-      analyserRef.current = null;
-      gainNodeRef.current = null;
-    };
-  }, [audioUrl]);
+     let ctx: AudioContext | null = null;
+     let analyser: AnalyserNode | null = null;
+     let gainNode: GainNode | null = null;
+     let source: MediaElementAudioSourceNode | null = null;
+
+     try {
+       const AudioContextClass = window.AudioContext || ((window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext);
+       ctx = new AudioContextClass();
+       analyser = ctx.createAnalyser();
+       source = ctx.createMediaElementSource(audioRef.current);
+       gainNode = ctx.createGain();
+
+       analyser.fftSize = 512;
+       source.connect(analyser);
+       analyser.connect(gainNode);
+       gainNode.connect(ctx.destination);
+
+       audioContextRef.current = ctx;
+       analyserRef.current = analyser;
+       gainNodeRef.current = gainNode;
+     } catch (error) {
+       console.error('Audio context setup failed:', error);
+       if (ctx) {
+         try { ctx.close(); } catch {}
+       }
+       return;
+     }
+
+     return () => {
+       try {
+         source?.disconnect?.();
+         analyser?.disconnect?.();
+         gainNode?.disconnect?.();
+       } catch {}
+       if (ctx) {
+         ctx.close().catch(() => {});
+       }
+       audioContextRef.current = null;
+       analyserRef.current = null;
+       gainNodeRef.current = null;
+     };
+   }, [audioUrl]);
 
   // Sync volume with audio element and gain node
   useEffect(() => {
@@ -341,8 +441,25 @@ export default function Home() {
     });
   }, []);
 
-  const handleGenerate = useCallback(async () => {
+  const handleGenerate = useCallback(async (isRetry: boolean = false) => {
     if (!prompt.trim()) return;
+
+    // Prompt quality validation
+    const wordCount = prompt.trim().split(/\s+/).filter(w => w.length > 0).length;
+    if (wordCount < 3) {
+      const errMsg = 'Please add more detail (at least 3 words) for better results. Try describing the mood, instruments, and setting.';
+      setError(errMsg);
+      setErrorDetails(errMsg);
+      setShowErrorBanner(true);
+      setStatus('error');
+      return;
+    }
+
+    if (isRetry) {
+      setRetryCount(prev => prev + 1);
+    } else {
+      setRetryCount(0);
+    }
 
     clearPoll();
     setStatus('generating');
@@ -350,6 +467,8 @@ export default function Home() {
     setTaskId(null);
     setProgress(0);
     setError(null);
+    setErrorDetails(null);
+    setShowErrorBanner(false);
     setSongTitle(null);
     setEta(null);
     setTracks([]);
@@ -359,6 +478,7 @@ export default function Home() {
     setCurrentTime(0);
     setTrackDuration(0);
     setShouldRefreshAudioKey((v) => !v);
+    setIsPreview(outputLength === '15');
 
     try {
       const response = await fetch('/api/generate', {
@@ -368,6 +488,8 @@ export default function Home() {
           prompt,
           music_style: musicStyle || undefined,
           make_instrumental: makeInstrumental,
+          num_outputs: numOutputs.toString(),
+          output_length: outputLength,
           userApiKey: userApiKey || undefined,
         }),
       });
@@ -375,7 +497,12 @@ export default function Home() {
       const data = await response.json();
 
       if (!response.ok || !data.taskId) {
-        throw new Error(data.error || 'Failed to start generation');
+        const errMsg = data.error || 'Failed to start generation';
+        setError(errMsg);
+        setErrorDetails(errMsg);
+        setShowErrorBanner(true);
+        setStatus('error');
+        return;
       }
 
       setTaskId(data.taskId);
@@ -430,7 +557,7 @@ export default function Home() {
 
               setTracks(allTracks);
               setAudioUrl(allTracks[0]?.url || statusData.audioUrl);
-              setSongTitle(typeof (statusData as any).title === 'string' ? (statusData as any).title as string : null);
+              setSongTitle(typeof (statusData as Record<string, unknown>).title === 'string' ? ((statusData as Record<string, unknown>).title as string) : null);
               setActiveTrackIndex(0);
               setStatus('completed');
               setProgress(100);
@@ -455,10 +582,18 @@ export default function Home() {
                 prompt,
                 musicStyle,
                 makeInstrumental,
-                title: typeof (statusData as any).title === 'string' ? ((statusData as any).title as string) : null,
+                title: typeof (statusData as Record<string, unknown>).title === 'string' ? ((statusData as Record<string, unknown>).title as string) : null,
                 tracks: allTracks,
                 createdAt: Date.now(),
               });
+
+              setRetryCount(0);
+
+              // Offer upgrade to full quality if this was a preview
+              if (isPreview && outputLength === '15' && status !== 'error') {
+                setIsPreview(false);
+                setUpgradeAvailable(true);
+              }
 
               try {
                 es.close();
@@ -466,7 +601,13 @@ export default function Home() {
             } else if (statusData.status === 'failed') {
               clearInterval(sseTimer);
               clearPoll();
-              throw new Error(typeof (statusData as any).error === 'string' ? ((statusData as any).error as string) : 'Generation failed');
+              const errMsg = typeof (statusData as Record<string, unknown>).error === 'string' ? ((statusData as Record<string, unknown>).error as string) : 'Generation failed';
+              setShowErrorBanner(true);
+              setError(errMsg);
+              setStatus('error');
+              try {
+                es.close();
+              } catch {}
             } else {
               // Processing
               const msg = statusData.message || 'Processing your request...';
@@ -515,7 +656,7 @@ export default function Home() {
       setError(err instanceof Error ? err.message : 'Error starting generation');
       setStatus('error');
     }
-  }, [prompt, musicStyle, makeInstrumental, userApiKey, clearPoll, saveToHistory]);
+   }, [prompt, musicStyle, makeInstrumental, numOutputs, outputLength, userApiKey, status, isPreview, clearPoll, saveToHistory, setUpgradeAvailable]);
 
   const handleCancel = useCallback(() => {
     clearPoll();
@@ -534,6 +675,8 @@ export default function Home() {
     setTaskId(null);
     setProgress(0);
     setError(null);
+    setErrorDetails(null);
+    setShowErrorBanner(false);
     setSongTitle(null);
     setEta(null);
     setProcessingMessage('');
@@ -564,29 +707,80 @@ export default function Home() {
     setShouldRefreshAudioKey((v) => !v);
   }, [clearPoll]);
 
-  const handleTrackSelect = useCallback((index: number, url: string) => {
-    setActiveTrackIndex(index);
-    // Force audio ref reset by toggling key -> forces re-sync and events to fire correctly for isPlaying
-    setCurrentTime(0);
-    setTrackDuration(0);
-    setAudioUrl(url);
-    setShouldRefreshAudioKey((v) => !v);
-  }, []);
+  const handleTrackSelect = useCallback((index: number, track: Track) => {
+    try {
+      if (!track || typeof track !== 'object') {
+        console.warn('Invalid track object', { index, track });
+        return;
+      }
 
-  const handleFeatured = useCallback((featured: typeof FEATURED_PROMPTS[0]) => {
-    setPrompt(featured.prompt);
-    setMusicStyle(featured.style);
-    setMakeInstrumental(false);
-    textareaRef.current?.focus();
-  }, []);
+      // Prefer URL, fall back to WAV URL if available
+      const selectedUrl = (track as Track).url || (track as Track).wavUrl;
+      if (!selectedUrl) {
+        console.warn(`Track ${index} has no playable URL`, track);
+        return; // Guard: ignore clicks on unavailable tracks
+      }
 
-  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      const working = status === 'generating' || status === 'polling';
-      if (!working && prompt.trim()) handleGenerate();
+      setActiveTrackIndex(index);
+      setCurrentTime(0);
+      setTrackDuration(0);
+      setAudioUrl(selectedUrl);
+      setShouldRefreshAudioKey((v) => !v);
+      // Clear any errors when switching tracks successfully
+      setError(null);
+      setErrorDetails(null);
+      setShowErrorBanner(false);
+    } catch (error) {
+      console.error('Error selecting track:', error);
     }
-  }, [status, prompt, handleGenerate]);
+  }, []);
+
+   const handleFeatured = useCallback((featured: typeof FEATURED_PROMPTS[0]) => {
+     setPrompt(featured.prompt);
+     setMusicStyle(featured.style);
+     setMakeInstrumental(false);
+     setHasInteracted(true);
+     textareaRef.current?.focus();
+   }, []);
+
+  const handleSmartExpand = useCallback(() => {
+    const lowerPrompt = prompt.toLowerCase();
+    let expanded = prompt;
+
+    // Check for keywords and apply template
+    for (const [key, template] of Object.entries(PROMPT_TEMPLATES)) {
+      if (lowerPrompt.includes(key) && prompt.split(/\s+/).length < 8) {
+        expanded = template;
+        setPrompt(template);
+        setHasInteracted(true);
+        return;
+      }
+    }
+
+    // Generic expansion for short prompts (3-5 words)
+    const wordCount = prompt.split(/\s+/).filter(w => w.length > 0).length;
+    if (wordCount >= 2 && wordCount < 6) {
+      expanded = `${prompt}, lo-fi atmosphere, vinyl crackle warmth, soft textures, 75-85 BPM`;
+      setPrompt(expanded);
+      setHasInteracted(true);
+    }
+  }, [prompt]);
+
+  const handleCopyPrompt = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(prompt);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  }, [prompt]);
+
+   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+     if (e.key === 'Enter' && !e.shiftKey) {
+       e.preventDefault();
+       const working = status === 'generating' || status === 'polling';
+       if (!working && prompt.trim()) handleGenerate();
+     }
+   }, [status, prompt, handleGenerate]);
 
   const togglePlayPause = useCallback(() => {
     if (!audioRef.current) return;
@@ -605,14 +799,56 @@ export default function Home() {
     }
   }, []);
 
-  const toggleLoop = useCallback(() => {
-    if (!audioRef.current) return;
-    const newLoop = !audioRef.current.loop;
-    audioRef.current.loop = newLoop;
-    setIsLooping(newLoop);
-  }, []);
+   const toggleLoop = useCallback(() => {
+     if (!audioRef.current) return;
+     const newLoop = !audioRef.current.loop;
+     audioRef.current.loop = newLoop;
+     setIsLooping(newLoop);
+   }, []);
 
-  const isWorking = status === 'generating' || status === 'polling';
+   // Keyboard shortcuts - placed after all handlers are defined
+   useEffect(() => {
+     const handleKeyDown = (e: KeyboardEvent) => {
+       if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) {
+         if (e.key === 'Escape') {
+           e.preventDefault();
+           if (status === 'polling' || status === 'generating') {
+             handleCancel();
+           } else if (status === 'error') {
+             handleReset();
+           }
+         }
+         return;
+       }
+
+       switch (e.key) {
+         case 'Enter':
+           if (prompt.trim() && status !== 'generating' && status !== 'polling') {
+             e.preventDefault();
+             handleGenerate();
+           }
+           break;
+         case ' ':
+           if (audioUrl && status === 'completed') {
+             e.preventDefault();
+             togglePlayPause();
+           }
+           break;
+         case 'Escape':
+           if (status === 'polling' || status === 'generating') {
+             handleCancel();
+           } else if (status === 'error') {
+             handleReset();
+           }
+           break;
+       }
+     };
+
+     window.addEventListener('keydown', handleKeyDown);
+     return () => window.removeEventListener('keydown', handleKeyDown);
+   }, [prompt, status, audioUrl, handleGenerate, handleCancel, handleReset, togglePlayPause]);
+
+   const isWorking = status === 'generating' || status === 'polling';
   const displayTitle = songTitle || prompt.slice(0, 40) + (prompt.length > 40 ? '...' : '');
   const currentTrack = tracks[activeTrackIndex];
   const creditsLow = credits != null && credits < LOW_CREDITS_THRESHOLD;
@@ -621,21 +857,133 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-950 via-black to-gray-900 text-white flex flex-col items-center justify-center p-4">
       <div className="max-w-lg w-full space-y-8">
-        {/* Header */}
-        <div className="flex items-start justify-between">
-          <div className="space-y-2">
-            <h1 className="text-5xl font-bold bg-gradient-to-r from-cyan-400 to-purple-500 bg-clip-text text-transparent">
-              Ghostname
-            </h1>
-            <p className="text-gray-400">AI-Powered Lofi Music Generator</p>
-          </div>
+         {/* Header */}
+         <div className="flex items-start justify-between">
+           <div className="space-y-2">
+             <h1 className="text-4xl sm:text-5xl font-bold bg-gradient-to-r from-cyan-400 via-blue-400 to-purple-500 bg-clip-text text-transparent bg-[length:200%_auto] animate-gradient">
+               Ghostname
+             </h1>
+             <p className="text-gray-400 text-sm sm:text-base">AI-Powered Lofi Music Generator</p>
+           </div>
+           <div className="text-right">
+             <button
+               onClick={() => {
+                 const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
+                 fetch(url)
+                   .then((r) => r.json())
+                   .then((d) => {
+                     if (d.credits != null) {
+                       setCredits(d.credits);
+                       setCreditsLoadFailed(false);
+                     } else {
+                       setCreditsLoadFailed(true);
+                     }
+                   })
+                   .catch(() => setCreditsLoadFailed(true));
+               }}
+               className={`
+                 relative inline-flex items-center gap-1.5 rounded-xl px-3 py-2 transition-all
+                 ${creditsLow 
+                   ? 'bg-red-950/50 border-2 border-red-500/60 hover:border-red-400/80 shadow-lg shadow-red-900/50' 
+                   : 'bg-gray-900/60 border border-gray-700 hover:border-cyan-500/50 hover:bg-gray-800/80'
+                 }
+               `}
+               title="Click to refresh credits"
+               aria-label={`Credits: ${creditsDisplay}`}
+             >
+               {creditsLow && (
+                 <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full pulse-ring" aria-hidden="true" />
+               )}
+               <svg className={`w-4 h-4 ${creditsLow ? 'text-red-400' : 'text-cyan-400'}`} fill="currentColor" viewBox="0 0 24 24">
+                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+               </svg>
+               <span className={`text-sm font-medium ${creditsLow ? 'text-red-300' : 'text-cyan-400'}`}>
+                 {creditsDisplay}
+               </span>
+             </button>
+             {creditsLow && (
+               <p className="text-xs text-red-500 mt-1 flex items-center gap-1">
+                 <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                   <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+                 </svg>
+                 Low balance
+               </p>
+             )}
+             {history.length > 0 && (
+               <button
+                 onClick={() => setShowHistory((v) => !v)}
+                 className="mt-2 w-full text-xs text-gray-500 hover:text-gray-300 transition-colors flex items-center justify-center gap-1"
+               >
+                 {showHistory ? 'Hide' : 'Show'} history
+                 <svg className={`w-3 h-3 transition-transform ${showHistory ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                 </svg>
+               </button>
+             )}
+              </div>
+            </div>
+
+            {/* Generation Options */}
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="output_length" className="block text-xs font-medium text-gray-400 mb-1">
+                  Duration
+                </label>
+                <select
+                  id="output_length"
+                  value={outputLength}
+                  onChange={(e) => setOutputLength(e.target.value)}
+                  disabled={isWorking}
+                  className="w-full px-3 py-2 bg-gray-800/50 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-cyan-400 transition-all appearance-none cursor-pointer"
+                >
+                  <option value="15">15 seconds (fast)</option>
+                  <option value="30">30 seconds</option>
+                  <option value="60">60 seconds (high quality)</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="num_outputs" className="block text-xs font-medium text-gray-400 mb-1">
+                  Variations
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="num_outputs"
+                    type="range"
+                    min="1"
+                    max="4"
+                    value={numOutputs}
+                    onChange={(e) => setNumOutputs(Number(e.target.value))}
+                    disabled={isWorking}
+                    className="flex-1 h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400"
+                  />
+                  <span className="text-sm font-mono text-cyan-400 w-6 text-right">{numOutputs}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Cost Estimator */}
+            {!isWorking && (
+              <div className="flex items-center justify-between p-3 bg-gradient-to-r from-gray-800/40 to-gray-900/40 rounded-lg border border-gray-700/50">
+                <div className="flex flex-col">
+                  <span className="text-xs text-gray-400">Estimated cost</span>
+                  <span className="text-[10px] text-gray-500">
+                    ~{outputLength === '15' ? '15' : outputLength === '30' ? '30' : '60'}s × {numOutputs} {numOutputs === 1 ? 'track' : 'tracks'}
+                  </span>
+                </div>
+                <div className="text-right">
+                  <div className="text-lg font-bold text-cyan-400">
+                    ${estimateCost(numOutputs, outputLength).toFixed(2)}
+                  </div>
+                </div>
+              </div>
+            )}
           <div className="text-right">
-            <button
-              onClick={() => {
-                const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
-                fetch(url)
-                  .then((r) => r.json())
-                  .then((d) => {
+             <button
+               onClick={() => {
+                 const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
+                 fetch(url)
+                   .then((r) => r.json())
+                   .then((d) => {
                     if (d.credits != null) {
                       setCredits(d.credits);
                       setCreditsLoadFailed(false);
@@ -644,19 +992,26 @@ export default function Home() {
                     }
                   })
                   .catch(() => setCreditsLoadFailed(true));
-              }}
-              className={`inline-flex items-center gap-1.5 bg-gray-900/80 border rounded-xl px-3 py-2 transition-all hover:border-gray-600 ${
-                creditsLow ? 'border-red-500/50' : 'border-gray-700'
-              }`}
-              title="Click to refresh"
-            >
-              <svg className={`w-4 h-4 ${creditsLow ? 'text-red-400' : 'text-cyan-400'}`} fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
-              </svg>
-              <span className={`text-sm font-medium ${creditsLow ? 'text-red-400' : 'text-cyan-400'}`}>
-                {creditsDisplay}
-              </span>
-            </button>
+               }}
+               className={`
+                 relative inline-flex items-center gap-1.5 px-3 py-2 rounded-xl transition-all
+                 ${creditsLow 
+                   ? 'bg-red-900/30 border-2 border-red-500/60 hover:border-red-400/80 shadow-lg shadow-red-900/50' 
+                   : 'bg-gray-900/80 border border-gray-700 hover:border-cyan-500/50'
+                 }
+               `}
+               title="Click to refresh credits"
+             >
+               {creditsLow && (
+                 <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full pulse-ring" />
+               )}
+               <svg className={`w-4 h-4 ${creditsLow ? 'text-red-400' : 'text-cyan-400'}`} fill="currentColor" viewBox="0 0 24 24">
+                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+               </svg>
+               <span className={`text-sm font-medium ${creditsLow ? 'text-red-300' : 'text-cyan-400'}`}>
+                 {creditsDisplay}
+               </span>
+             </button>
             {creditsLow && (
               <p className="text-xs text-red-500 mt-1">Low balance</p>
             )}
@@ -671,12 +1026,66 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Error Banner */}
-        {showErrorBanner && (
-          <div className="p-4 bg-red-900/30 border border-red-800 rounded-xl animate-pulse">
-            <p className="text-red-400 text-sm">{error || 'Audio load failed. Please try another track.'}</p>
-          </div>
-        )}
+        {/* Error Banner - Enhanced */}
+        {showErrorBanner && errorDetails && (
+          <div className="relative overflow-hidden rounded-xl border border-red-800/50 bg-gradient-to-r from-red-950/80 via-red-900/60 to-rose-900/80 p-5 shadow-lg animate-slideInUp">
+            {/* Decorative glow */}
+            <div className="absolute inset-0 bg-gradient-to-r from-red-500/5 via-transparent to-rose-500/5 pointer-events-none" />
+            
+            <div className="relative flex flex-wrap items-start gap-4">
+              <div className="flex-shrink-0 w-10 h-10 rounded-full bg-red-500/20 border border-red-500/30 flex items-center justify-center">
+                <svg className="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+              </div>
+              
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm font-semibold text-red-200 mb-1">Generation Failed</h3>
+                <p className="text-sm text-red-100/90 break-words leading-relaxed">{errorDetails}</p>
+                
+                {retryCount > 0 && (
+                  <p className="text-xs text-red-300/70 mt-2">
+                    Retry attempt {retryCount}
+                  </p>
+                )}
+              </div>
+
+              <div className="flex gap-2 w-full sm:w-auto sm:ml-auto">
+                {status === 'error' && prompt.trim() && (
+                  <button
+                    onClick={() => {
+                      setShowErrorBanner(false);
+                      setErrorDetails(null);
+                      setError(null);
+                      handleGenerate(true);
+                    }}
+                    className="flex-1 sm:flex-none inline-flex items-center justify-center gap-2 px-4 py-2 bg-red-600/80 hover:bg-red-500 border border-red-500/50 rounded-lg text-sm font-medium text-white transition-all hover:scale-105 active:scale-95 shadow-lg shadow-red-900/50"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    Retry
+                  </button>
+                )}
+
+                <button
+                  onClick={() => {
+                    setShowErrorBanner(false);
+                    setErrorDetails(null);
+                    setError(null);
+                  }}
+                  className="flex-1 sm:flex-none w-10 h-10 sm:w-auto sm:px-4 rounded-lg bg-red-900/30 hover:bg-red-800/50 border border-red-700/30 flex items-center justify-center transition-colors"
+                  aria-label="Dismiss error"
+                >
+                  <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                  <span className="hidden sm:inline sm:ml-2">Dismiss</span>
+                 </button>
+               </div>
+             </div>
+           </div>
+         )}
 
         {/* History Panel */}
         {showHistory && history.length > 0 && (
@@ -703,28 +1112,89 @@ export default function Home() {
           </div>
         )}
 
-        {/* Main Card */}
-        <div className="bg-gray-900/80 border border-gray-800 rounded-2xl p-6 space-y-6 shadow-2xl">
+        {/* Main Card - Enhanced */}
+        <div className="relative group">
+          {/* Glow effect */}
+          <div className="absolute -inset-0.5 bg-gradient-to-r from-cyan-500/20 via-purple-500/20 to-cyan-500/20 rounded-2xl blur opacity-30 group-hover:opacity-50 transition-opacity duration-500" />
+          
+          <div className="relative bg-gray-900/90 backdrop-blur-xl border border-gray-800/50 rounded-2xl p-6 space-y-6 shadow-2xl">
+            {/* Content remains the same */}
           {/* Prompt + Style Row */}
           <div className="space-y-3">
-            <div>
-              <label htmlFor="prompt" className="block text-sm font-medium text-gray-300 mb-1.5">
-                Describe your track
-              </label>
-              <textarea
-                ref={textareaRef}
-                id="prompt"
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="e.g., 'rainy night in Tokyo with vinyl crackle and mellow piano'"
-                className="w-full p-4 bg-gray-800/50 border border-gray-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:border-transparent transition-all resize-none"
-                rows={3}
-                disabled={isWorking}
-                maxLength={280}
-              />
-              <p className="text-xs text-gray-500 text-right mt-1">{prompt.length}/280</p>
-            </div>
+             <div>
+               <label htmlFor="prompt" className="block text-sm font-medium text-gray-300 mb-1.5">
+                 Describe your track
+               </label>
+               <div className="relative">
+                 <textarea
+                   ref={textareaRef}
+                   id="prompt"
+                   value={prompt}
+                   onChange={(e) => {
+                     setPrompt(e.target.value);
+                     if (!hasInteracted) setHasInteracted(true);
+                   }}
+                   onKeyDown={handleKeyDown}
+                    placeholder="e.g., 'rainy night in Tokyo with vinyl crackle and mellow piano'"
+                    className="w-full p-4 pr-20 bg-gray-800/50 border border-gray-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:border-transparent transition-all resize-none"
+                    rows={3}
+                    disabled={isWorking}
+                    maxLength={280}
+                    aria-label="Describe your track"
+                  />
+                  {prompt.trim() && (
+                    <div className="flex gap-1 absolute right-3 bottom-3">
+                      <button
+                        onClick={handleSmartExpand}
+                        disabled={isWorking || prompt.split(/\s+/).length >= 6}
+                        className="p-1.5 rounded-lg bg-gray-700/50 hover:bg-gray-600 text-cyan-400 hover:text-cyan-300 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                        title="Auto-enhance your prompt with lofi details"
+                        aria-label="Smart expand prompt"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={handleCopyPrompt}
+                        className="p-1.5 rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-400 hover:text-white transition-colors"
+                        title="Copy prompt to clipboard"
+                        aria-label="Copy prompt"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center justify-between mt-1">
+                  <div className="flex items-center gap-2">
+                    {prompt.trim() && prompt.split(/\s+/).length < 6 && (
+                      <button
+                        onClick={handleSmartExpand}
+                        disabled={isWorking}
+                        className="inline-flex items-center gap-1 text-xs text-cyan-400 hover:text-cyan-300 transition-colors disabled:opacity-50"
+                        title="Auto-enhance your prompt with lofi details"
+                      >
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                        Smart Expand
+                      </button>
+                    )}
+                    <p className="text-xs text-gray-500">
+                      {!hasInteracted && (
+                        <span className="flex items-center gap-1.5 opacity-80">
+                          <kbd className="px-1.5 py-0.5 bg-gray-800 border border-gray-600 rounded text-[10px] font-mono text-gray-300">Enter</kbd>
+                          to generate
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                  <p className="text-xs text-gray-500 text-right">{prompt.length}/280</p>
+                </div>
+              </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div className="relative">
@@ -753,9 +1223,11 @@ export default function Home() {
                     type="button"
                     onClick={() => setMakeInstrumental((v) => !v)}
                     disabled={isWorking}
-                    className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${
+                    className={`relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:ring-offset-2 focus:ring-offset-gray-900 ${
                       makeInstrumental ? 'bg-cyan-500' : 'bg-gray-700'
                     } disabled:opacity-50`}
+                    aria-checked={makeInstrumental}
+                    role="switch"
                   >
                     <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200 ${
                       makeInstrumental ? 'translate-x-5' : ''
@@ -769,20 +1241,32 @@ export default function Home() {
 
           {/* Featured Prompts */}
           <div className="space-y-2">
-            <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">Featured</p>
+            <p className="text-xs font-medium text-gray-500 uppercase tracking-wider flex items-center gap-2">
+              <svg className="w-3.5 h-3.5 text-purple-400" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+              </svg>
+              Featured Prompts
+            </p>
             <div className="flex flex-wrap gap-2">
-              {FEATURED_PROMPTS.map((fp) => (
-                <button
-                  key={fp.label}
-                  onClick={() => handleFeatured(fp)}
-                  disabled={isWorking}
-                  className="px-3 py-2 text-xs rounded-xl border border-gray-700 bg-gray-800/40 text-gray-300 hover:text-white hover:border-cyan-500/50 hover:bg-cyan-500/10 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
-                >
-                  <span className="text-base">{fp.label.split(' ')[0]}</span>
-                  <span>{fp.label.split(' ').slice(1).join(' ')}</span>
-                  <span className="hidden mobile:inline text-[10px] text-cyan-400/60">{fp.style}</span>
-                </button>
-              ))}
+              {FEATURED_PROMPTS.map((fp) => {
+                const [emoji, ...nameParts] = fp.label.split(' ');
+                const name = nameParts.join(' ');
+                return (
+                  <button
+                    key={fp.label}
+                    onClick={() => handleFeatured(fp)}
+                    disabled={isWorking}
+                    className="group relative px-3 py-2 text-xs rounded-xl border border-gray-700 bg-gradient-to-br from-gray-800/60 to-gray-900/40 text-gray-300 hover:text-white hover:border-cyan-500/50 hover:from-cyan-900/30 hover:to-purple-900/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 overflow-hidden"
+                  >
+                    <span className="text-base group-hover:scale-110 transition-transform">{emoji}</span>
+                    <span>{name}</span>
+                    <span className="hidden sm:inline text-[10px] text-cyan-400/60 ml-1 px-1.5 py-0.5 bg-cyan-950/30 rounded-full border border-cyan-500/20">
+                      {fp.style}
+                    </span>
+                    <span className="absolute inset-0 bg-gradient-to-r from-cyan-500/0 via-cyan-500/5 to-purple-500/0 opacity-0 group-hover:opacity-100 transition-opacity" />
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -793,43 +1277,69 @@ export default function Home() {
             </div>
           )}
 
-          {/* Action Row */}
-          <div className="flex gap-3">
-            <button
-              onClick={status === 'error' ? handleReset : status === 'polling' ? handleCancel : handleGenerate}
-              disabled={isWorking ? false : !prompt.trim() && status === 'idle'}
-              className={`flex-1 py-4 rounded-xl font-semibold text-lg transition-all duration-200 ${
-                status === 'error'
-                  ? 'bg-orange-600 hover:bg-orange-700'
-                  : status === 'polling'
-                  ? 'bg-red-600 hover:bg-red-700'
-                  : isWorking
-                  ? 'bg-gray-700 cursor-not-allowed'
-                  : 'bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-400 hover:to-purple-500 shadow-lg shadow-cyan-500/25 hover:shadow-cyan-400/40'
-              } disabled:opacity-50 disabled:cursor-not-allowed`}
-            >
-              {status === 'idle' && 'Generate Music'}
-              {status === 'generating' && (
-                <span className="flex items-center justify-center gap-2">
-                  <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                  Starting...
-                </span>
-              )}
-              {status === 'polling' && (
-                <span className="flex items-center justify-center gap-2">
-                  <svg className="animate-pulse h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
-                  </svg>
-                  Cancel
-                </span>
-              )}
-              {status === 'completed' && 'Generate Another'}
-              {status === 'error' && 'Try Again'}
-            </button>
-          </div>
+           {/* Action Row */}
+           <div className="flex gap-3">
+              <button
+                onClick={() => status === 'error' ? handleReset() : status === 'polling' ? handleCancel() : handleGenerate()}
+                disabled={status === 'generating' || (!prompt.trim() && status === 'idle')}
+                className={`
+                  relative flex-1 py-4 rounded-xl font-semibold text-lg transition-all duration-200
+                  ${status === 'generating'
+                    ? 'bg-gray-700 cursor-not-allowed shadow-none'
+                    : status === 'polling'
+                    ? 'bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 shadow-lg shadow-red-900/30 hover:shadow-red-800/40'
+                    : status === 'error'
+                    ? 'bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 shadow-lg shadow-orange-900/30 hover:shadow-orange-800/40 hover:scale-[1.02] active:scale-[0.98]'
+                    : 'bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-400 hover:to-purple-500 shadow-lg shadow-cyan-500/25 hover:shadow-cyan-400/40 hover:scale-[1.02] active:scale-[0.98] pulse-button'
+                  }
+                  focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:ring-offset-2 focus:ring-offset-gray-900
+                `}
+               aria-label={status === 'idle' ? 'Generate Music' : status === 'generating' ? 'Generating music' : status === 'polling' ? 'Cancel generation' : status === 'error' ? 'Try again' : 'Generate another track'}
+             >
+               {status === 'idle' && (
+                 <span className="flex items-center justify-center gap-2">
+                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                   </svg>
+                   Generate Music
+                   <span className="hidden sm:inline text-xs opacity-70 font-normal">(Enter)</span>
+                 </span>
+               )}
+               {status === 'generating' && (
+                 <span className="flex items-center justify-center gap-2">
+                   <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
+                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                   </svg>
+                   Starting...
+                 </span>
+               )}
+               {status === 'polling' && (
+                 <span className="flex items-center justify-center gap-2">
+                   <svg className="animate-pulse h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+                     <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                   </svg>
+                   Cancel
+                 </span>
+               )}
+               {status === 'completed' && (
+                 <span className="flex items-center justify-center gap-2">
+                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                   </svg>
+                   Generate Another
+                 </span>
+               )}
+               {status === 'error' && (
+                 <span className="flex items-center justify-center gap-2">
+                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                   </svg>
+                   Try Again
+                 </span>
+               )}
+             </button>
+           </div>
 
           {/* Progress Bar - Enhanced */}
           {status === 'polling' && (
@@ -888,45 +1398,101 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Track Tabs - Enhanced */}
-              {tracks.length > 1 && (
-                  <div className="flex gap-2 border-b border-gray-800 pb-3">
-                    {tracks.map((track, i) => {
-                      const durationText = track.duration ? formatDuration(track.duration) : undefined;
-                      const version = track.version || `v${i + 1}`;
-                      return (
+               {/* Track Tabs - Enhanced with smooth transitions */}
+               {tracks.length > 1 && (
+                 <div className="flex gap-2 border-b border-gray-800 pb-3 overflow-x-auto">
+                   {tracks.map((track, i) => {
+                     const durationText = track.duration ? formatDuration(track.duration) : undefined;
+                     const version = track.version || `v${i + 1}`;
+                     const isActive = activeTrackIndex === i;
+                     return (
                         <button
+                          type="button"
                           key={i}
-                          onClick={() => handleTrackSelect(i, track.url)}
-                          className={`py-2 px-4 rounded-lg text-sm font-medium transition-all relative ${
-                            activeTrackIndex === i
-                              ? 'bg-cyan-500/20 border border-cyan-500 text-cyan-400'
-                              : 'bg-gray-800/30 border border-gray-700 text-gray-400 hover:text-white hover:border-gray-600'
-                          }`}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            handleTrackSelect(i, track);
+                          }}
+                          disabled={!track.url && !track.wavUrl}
+                          className={`
+                            relative flex-shrink-0 py-2 px-4 rounded-lg text-sm font-medium transition-all min-w-[100px]
+                            ${isActive
+                              ? 'bg-gradient-to-br from-cyan-500/20 to-purple-500/20 border border-cyan-500/50 text-cyan-300 shadow-lg shadow-cyan-900/30'
+                              : (!track.url && !track.wavUrl)
+                              ? 'bg-gray-800/20 border border-gray-800 text-gray-600 cursor-not-allowed opacity-50'
+                              : 'bg-gray-800/40 border border-gray-700 text-gray-400 hover:text-white hover:border-gray-600 hover:bg-gray-700/40'
+                            }
+                          `}
                         >
-                          <div className="flex items-center gap-2">
-                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                              <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
-                            </svg>
-                            <div className="flex flex-col items-start">
-                              <span className="text-xs opacity-70">{version}</span>
-                              <span>{track.title || `Track ${i + 1}`}</span>
-                            </div>
-                          </div>
-                          {durationText && (
-                            <div className="text-xs opacity-60 mt-0.5">{durationText}</div>
-                          )}
-                          {activeTrackIndex === i && (
-                            <div className="absolute -bottom-1.5 left-0 right-0 h-1 bg-cyan-400 rounded-full"></div>
-                          )}
+                         <div className="flex flex-col items-center gap-0.5">
+                           <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                             <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+                           </svg>
+                           <span className="text-[10px] opacity-70 uppercase tracking-wide">{version}</span>
+                           <span className="text-xs truncate max-w-[80px]">{track.title || `Track ${i + 1}`}</span>
+                         </div>
+                         {durationText && (
+                           <div className="text-[10px] opacity-60 mt-1">{durationText}</div>
+                         )}
+                         {isActive && (
+                           <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-2/3 h-1 bg-gradient-to-r from-cyan-400 to-purple-400 rounded-full shadow-lg" />
+                         )}
                        </button>
                      );
                    })}
                  </div>
-              )}
+                )}
 
-              {/* Enhanced Audio Player */}
-              <div className="space-y-4">
+                {/* Upgrade to Full Quality Banner */}
+                {upgradeAvailable && (
+                  <div className="relative overflow-hidden rounded-xl border border-cyan-800/50 bg-gradient-to-r from-cyan-950/80 via-blue-900/60 to-purple-900/80 p-4 shadow-lg animate-slideInUp">
+                    <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/5 via-transparent to-purple-500/5 pointer-events-none" />
+                    
+                    <div className="relative flex items-center gap-3">
+                      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center">
+                        <svg className="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                      </div>
+                      
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-cyan-200">
+                          Upgrade to High Quality
+                        </p>
+                        <p className="text-xs text-cyan-100/70">
+                          Get a 60-second crystal clear version with enhanced details
+                        </p>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => {
+                            setUpgradeAvailable(false);
+                            setOutputLength('60');
+                            handleGenerate();
+                          }}
+                          className="inline-flex items-center gap-2 px-4 py-2 bg-cyan-600/80 hover:bg-cyan-500 border border-cyan-500/50 rounded-lg text-sm font-medium text-white transition-all hover:scale-105 active:scale-95 shadow-lg shadow-cyan-900/50"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                          </svg>
+                          Upgrade (${estimateCost(1, '60').toFixed(2)})
+                        </button>
+                        <button
+                          onClick={() => setUpgradeAvailable(false)}
+                          className="px-3 py-2 rounded-lg bg-gray-800/50 hover:bg-gray-700 border border-gray-600 text-gray-300 hover:text-white transition-colors"
+                          aria-label="Dismiss upgrade offer"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+               {/* Enhanced Audio Player */}
+               <div className="space-y-4">
                 {/* Hidden audio element with key trigger to force re-mount and sync */}
                 <audio
                   ref={audioRef}
@@ -946,50 +1512,61 @@ export default function Home() {
                   }}
                 />
 
-                {/* Player Controls */}
-                <div className="bg-gray-800/50 rounded-xl p-4 space-y-3 border border-gray-700/50">
-                  {/* Play/Pause and Loop */}
-                  <div className="flex items-center gap-3">
-                    <button
-                      onClick={togglePlayPause}
-                      className="w-12 h-12 rounded-full bg-gradient-to-r from-cyan-500 to-purple-500 hover:from-cyan-400 hover:to-purple-400 flex items-center justify-center flex-shrink-0 transition-all shadow-lg shadow-cyan-500/40 hover:shadow-cyan-400/50 hover:scale-105"
-                      title={isPlaying ? 'Pause' : 'Play'}
-                    >
-                      {isPlaying ? <PauseIcon /> : <PlayIcon />}
-                    </button>
+                 {/* Player Controls */}
+                 <div className="bg-gray-800/40 backdrop-blur-sm rounded-xl p-4 space-y-3 border border-gray-700/50">
+                   {/* Play/Pause and Loop */}
+                   <div className="flex items-center gap-3">
+                     <button
+                       onClick={togglePlayPause}
+                       className="group relative w-12 h-12 rounded-full bg-gradient-to-r from-cyan-500 to-purple-500 hover:from-cyan-400 hover:to-purple-400 flex items-center justify-center flex-shrink-0 transition-all hover:scale-105 active:scale-95 shadow-lg shadow-cyan-500/30 hover:shadow-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:ring-offset-2 focus:ring-offset-gray-900"
+                       title={isPlaying ? 'Pause' : 'Play'}
+                       aria-label={isPlaying ? 'Pause playback' : 'Start playback'}
+                     >
+                       {isPlaying ? <PauseIcon /> : <PlayIcon />}
+                       {isPlaying && (
+                         <span className="absolute inset-0 rounded-full border-2 border-cyan-300 animate-ping opacity-75" />
+                       )}
+                     </button>
 
-                    <button
-                      onClick={toggleLoop}
-                      className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 transition-all ${
-                        isLooping
-                          ? 'bg-cyan-500/30 border border-cyan-500'
-                          : 'bg-gray-700 hover:bg-gray-600 border border-gray-600'
-                      }`}
-                      title={isLooping ? 'Disable loop' : 'Enable loop'}
-                    >
-                      <svg className={`w-5 h-5 ${isLooping ? 'text-cyan-400' : 'text-gray-400'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                      </svg>
-                    </button>
+                     <button
+                       onClick={toggleLoop}
+                       className={`
+                         relative w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 transition-all
+                         ${isLooping
+                           ? 'bg-cyan-500/20 border-2 border-cyan-500 text-cyan-400'
+                           : 'bg-gray-700 hover:bg-gray-600 border border-gray-600 text-gray-400 hover:text-white'
+                         }
+                         focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:ring-offset-2 focus:ring-offset-gray-900
+                       `}
+                       title={isLooping ? 'Disable loop' : 'Enable loop'}
+                       aria-label={isLooping ? 'Disable loop playback' : 'Enable loop playback'}
+                     >
+                       <svg className={`w-5 h-5 ${isLooping ? 'text-cyan-400' : 'text-gray-400'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                       </svg>
+                       {isLooping && (
+                         <span className="absolute inset-0 rounded-full border border-cyan-400/30 animate-pulse-ring" />
+                       )}
+                     </button>
 
-                    {/* Volume Control */}
-                    <div className="flex items-center gap-1.5 ml-auto">
-                      <svg className="w-4 h-4 text-gray-500" fill="currentColor" viewBox="0 0 24 24">
-                        <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
-                      </svg>
-                      <input
-                        type="range"
-                        min={0}
-                        max={1}
-                        step={0.05}
-                        value={volume}
-                        onChange={(e) => setVolume(Number(e.target.value))}
-                        aria-label="Volume control"
-                        title="Adjust volume"
-                        className="w-20 h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400"
-                      />
-                    </div>
-                  </div>
+                     {/* Volume Control */}
+                     <div className="flex items-center gap-1.5 ml-auto">
+                       <svg className="w-4 h-4 text-gray-500" fill="currentColor" viewBox="0 0 24 24">
+                         <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
+                       </svg>
+                       <input
+                         type="range"
+                         min={0}
+                         max={1}
+                         step={0.05}
+                         value={volume}
+                         onChange={(e) => setVolume(Number(e.target.value))}
+                         aria-label="Volume control"
+                         title="Adjust volume"
+                         className="w-20 h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400 hover:accent-cyan-300"
+                       />
+                     </div>
+                   </div>
 
                   {/* Progress Bar */}
                   <div className="space-y-1.5">
@@ -1029,61 +1606,33 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Download Buttons - Enhanced */}
-              <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-800">
-                {currentTrack?.wavUrl ? (
-                  <>
-                    <a
-                      href={currentTrack.url}
-                      download={`ghostname-${taskId?.slice(-6) || 'track'}-${currentTrack.version || `v${activeTrackIndex + 1}`}.mp3`}
-                      className="flex items-center justify-center gap-2 py-3 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-400 hover:to-emerald-500 rounded-xl font-semibold text-sm transition-all duration-200 shadow-lg shadow-green-500/25 hover:shadow-green-400/40 hover:scale-105"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
-                      MP3
-                    </a>
-                    <a
-                      href={currentTrack.wavUrl}
-                      download={`ghostname-${taskId?.slice(-6) || 'track'}-${currentTrack.version || `v${activeTrackIndex + 1}`}.wav`}
-                      className="flex items-center justify-center gap-2 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 rounded-xl font-semibold text-sm transition-all duration-200 shadow-lg shadow-blue-500/25 hover:shadow-blue-400/40 hover:scale-105"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
-                      WAV
-                    </a>
-                  </>
-                ) : tracks.length > 1 ? (
-                  tracks.map((track, i) => {
-                    const version = track.version || `v${i + 1}`;
-                    return (
-                      <a
-                        key={i}
-                        href={track.url}
-                        download={`ghostname-${taskId?.slice(-6) || 'track'}-${version}.mp3`}
-                        className="flex-1 flex items-center justify-center gap-2 py-3 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-400 hover:to-emerald-500 rounded-xl font-semibold text-sm transition-all duration-200 shadow-lg shadow-green-500/25"
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                        </svg>
-                        {version.toUpperCase()}
-                      </a>
-                    );
-                  })
-                ) : (
-                  <a
-                    href={audioUrl}
-                    download={`ghostname-${taskId?.slice(-6) || 'track'}.mp3`}
-                    className="flex-1 flex items-center justify-center gap-2 py-4 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-400 hover:to-emerald-500 rounded-xl font-semibold text-lg transition-all duration-200 shadow-lg shadow-green-500/25 hover:shadow-green-400/40"
-                  >
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                    Download MP3
-                  </a>
-                )}
-              </div>
+               {/* Download Buttons - Enhanced */}
+               <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-800">
+                 {currentTrack?.url && (
+                   <a
+                     href={currentTrack.url!}
+                     download={`ghostname-${taskId?.slice(-6) || 'track'}-${currentTrack.version || `v${activeTrackIndex + 1}`}.mp3`}
+                     className="flex items-center justify-center gap-2 py-3 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-400 hover:to-emerald-500 rounded-xl font-semibold text-sm transition-all duration-200 shadow-lg shadow-green-500/25 hover:shadow-green-400/40 hover:scale-105"
+                   >
+                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                     </svg>
+                     MP3
+                   </a>
+                 )}
+                 {currentTrack?.wavUrl && (
+                   <a
+                     href={currentTrack.wavUrl!}
+                     download={`ghostname-${taskId?.slice(-6) || 'track'}-${currentTrack.version || `v${activeTrackIndex + 1}`}.wav`}
+                     className="flex items-center justify-center gap-2 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 rounded-xl font-semibold text-sm transition-all duration-200 shadow-lg shadow-blue-500/25 hover:shadow-blue-400/40 hover:scale-105"
+                   >
+                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                     </svg>
+                     WAV
+                   </a>
+                 )}
+               </div>
             </div>
           )}
         </div>
