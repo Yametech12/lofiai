@@ -1344,9 +1344,9 @@ export default function Home() {
 
            {/* Action Row */}
            <div className="flex gap-3">
-               <button
-                 onClick={() => status === 'error' ? handleReset() : status === 'polling' ? handleCancel() : handleGenerate()}
-                 disabled={status === 'generating' || (!prompt.trim() && status === 'idle') || (status !== 'polling' && !userApiKey)}
+                <button
+                  onClick={() => status === 'error' ? handleReset() : status === 'polling' ? handleCancel() : handleGenerate()}
+                  disabled={status === 'generating' || (!prompt.trim() && status === 'idle') || (status !== 'polling' && !userApiKey && serverKeyConfigured !== true)}
                  className={`
                   relative flex-1 py-4 rounded-xl font-semibold text-lg transition-all duration-200
                   ${status === 'generating'
