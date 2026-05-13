@@ -160,12 +160,13 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      return NextResponse.json({
-        taskId,
-        conversionId: data.conversion_id_1 || null,
-        eta: data.eta || null,
-        creditEstimate: data.credit_estimate || null,
-      });
+       return NextResponse.json({
+         taskId,
+         conversionId1: data.conversion_id_1 || null,
+         conversionId2: data.conversion_id_2 || null,
+         eta: data.eta || null,
+         creditEstimate: data.credit_estimate || null,
+       });
     } catch (error: unknown) {
       if (error instanceof Error && error.name === 'TimeoutError') {
         return NextResponse.json({ error: ERROR_TIMEOUT }, { status: 504 });

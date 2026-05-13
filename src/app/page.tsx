@@ -140,7 +140,7 @@ export default function Home() {
   const [creditsLoadFailed, setCreditsLoadFailed] = useState(false);
   const [serverKeyConfigured, setServerKeyConfigured] = useState<boolean | null>(null); // null = unknown, true/false = known
   const [tracks, setTracks] = useState<Track[]>([]);
-  const [activeTrackIndex, setActiveTrackIndex] = useState(0);
+  const [activeTrackIndex, setActiveTrackIndex] = useState(-1);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [showHistory, setShowHistory] = useState(false);
 
@@ -482,9 +482,9 @@ export default function Home() {
     setShowErrorBanner(false);
     setSongTitle(null);
     setEta(null);
-    setTracks([]);
-    setActiveTrackIndex(0);
-    setProcessingMessage('');
+     setTracks([]);
+     setActiveTrackIndex(-1);
+     setProcessingMessage('');
     setIsPlaying(false);
     setCurrentTime(0);
     setTrackDuration(0);
@@ -608,12 +608,26 @@ export default function Home() {
               clearInterval(sseTimer);
               clearPoll();
 
-              const allTracks = Array.isArray(statusData.tracks) ? (statusData.tracks as Track[]) : [];
+               const allTracks = Array.isArray(statusData.tracks) ? (statusData.tracks as Track[]) : [];
 
-              setTracks(allTracks);
-              setAudioUrl(allTracks[0]?.url || statusData.audioUrl);
-              setSongTitle(typeof (statusData as Record<string, unknown>).title === 'string' ? ((statusData as Record<string, unknown>).title as string) : null);
-              setActiveTrackIndex(0);
+               // Ensure consistent ordering: v1 first, then v2
+               const sortedTracks = [...allTracks].sort((a, b) => {
+                 if (a.version === b.version) return 0;
+                 if (a.version === 'v1') return -1;
+                 if (a.version === 'v2') return 1;
+                 return 0;
+               });
+               // Prefer v2 with valid URL as default, else first track with a URL
+               let activeIndex = sortedTracks.findIndex(t => t.version === 'v2' && (t.url || t.wavUrl));
+               if (activeIndex < 0) {
+                 activeIndex = sortedTracks.findIndex(t => t.url || t.wavUrl);
+               }
+               if (activeIndex < 0) activeIndex = 0;
+
+               setTracks(sortedTracks);
+               setAudioUrl(sortedTracks[activeIndex]?.url || statusData.audioUrl);
+               setSongTitle(typeof (statusData as Record<string, unknown>).title === 'string' ? ((statusData as Record<string, unknown>).title as string) : null);
+               setActiveTrackIndex(activeIndex);
               setStatus('completed');
               setProgress(100);
               setProcessingMessage('');
@@ -755,26 +769,37 @@ export default function Home() {
     setSongTitle(null);
     setEta(null);
     setProcessingMessage('');
-    setTracks([]);
-    setActiveTrackIndex(0);
-    setIsPlaying(false);
+     setTracks([]);
+     setActiveTrackIndex(-1);
+     setIsPlaying(false);
     setCurrentTime(0);
     setTrackDuration(0);
     setShouldRefreshAudioKey((v) => !v);
   }, [clearPoll]);
 
-  const handleHistorySelect = useCallback((entry: HistoryEntry) => {
-    clearPoll();
-    setShowHistory(false);
-    setTracks(entry.tracks);
-    setAudioUrl(entry.tracks[0]?.url || null);
+   const handleHistorySelect = useCallback((entry: HistoryEntry) => {
+     clearPoll();
+     setShowHistory(false);
+     const sortedHistoryTracks = [...entry.tracks].sort((a, b) => {
+       if (a.version === b.version) return 0;
+       if (a.version === 'v1') return -1;
+       if (a.version === 'v2') return 1;
+       return 0;
+     });
+     let historyActiveIndex = sortedHistoryTracks.findIndex(t => t.version === 'v2' && (t.url || t.wavUrl));
+     if (historyActiveIndex < 0) {
+       historyActiveIndex = sortedHistoryTracks.findIndex(t => t.url || t.wavUrl);
+     }
+     if (historyActiveIndex < 0) historyActiveIndex = 0;
+     setActiveTrackIndex(historyActiveIndex);
+     setTracks(sortedHistoryTracks);
+     setAudioUrl(sortedHistoryTracks[historyActiveIndex]?.url || null);
     setSongTitle(entry.title);
     setTaskId(entry.taskId);
     setPrompt(entry.prompt);
-    setMusicStyle(entry.musicStyle || '');
-    setMakeInstrumental(entry.makeInstrumental || false);
-    setActiveTrackIndex(0);
-    setStatus('completed');
+     setMusicStyle(entry.musicStyle || '');
+     setMakeInstrumental(entry.makeInstrumental || false);
+     setStatus('completed');
     setProgress(100);
     setIsPlaying(false);
     setCurrentTime(0);
@@ -807,6 +832,9 @@ export default function Home() {
       setShowErrorBanner(false);
     } catch (error) {
       console.error('Error selecting track:', error);
+      setError('Failed to select track');
+      setErrorDetails('An unexpected error occurred while selecting the track.');
+      setShowErrorBanner(true);
     }
   }, []);
 
@@ -1129,7 +1157,17 @@ export default function Home() {
                 </svg>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium text-white truncate">{entry.title || entry.prompt.slice(0, 30)}</p>
-                  <p className="text-xs text-gray-500">{new Date(entry.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs text-gray-500">{new Date(entry.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</p>
+                    {entry.tracks && entry.tracks.length > 1 && (
+                      <span className="inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-cyan-900/30 text-cyan-300 border border-cyan-500/30">
+                        <svg className="w-2.5 h-2.5" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+                        </svg>
+                        v1 & v2
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7"/>

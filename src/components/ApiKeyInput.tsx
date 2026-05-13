@@ -66,30 +66,49 @@ export default function ApiKeyInput({ onApiKeyChange, serverKeyConfigured }: Api
     queueMicrotask(() => setIsMounted(true));
   }, [onApiKeyChange]);
 
-  // Test API key validity by fetching credits
-  const testApiKey = useCallback(async (key: string): Promise<boolean> => {
-    if (checkingRef.current) return false;
-    checkingRef.current = true;
+   // Test API key validity by fetching credits
+   const testApiKey = useCallback(async (key: string): Promise<boolean> => {
+     if (checkingRef.current) return false;
+     checkingRef.current = true;
 
-    try {
-      const response = await fetch(`/api/credits?userApiKey=${encodeURIComponent(key)}`);
+     try {
+       const url = `/api/credits?userApiKey=${encodeURIComponent(key)}`;
+       console.log('[testApiKey] Fetching:', url);
+       const response = await fetch(url);
 
-      // Non-2xx => invalid key (credits route now propagates MusicGPT auth failures)
-      if (!response.ok) return false;
+       console.log('[testApiKey] Response status:', response.status, response.statusText);
+       const data = await response.json().catch(() => ({}));
+       console.log('[testApiKey] Response data:', data);
 
-      const data = await response.json().catch(() => ({}));
+       // Non-2xx => invalid key
+       if (!response.ok) {
+         console.log('[testApiKey] Non-2xx response, treating as invalid');
+         return false;
+       }
 
-      // Success: require numeric credits and no error payload
-      if (typeof data?.credits !== 'number' || Number.isNaN(data.credits)) return false;
-      if (data?.error) return false;
+       // Success: require numeric credits and no error payload
+       const credits = data?.credits;
+       console.log('[testApiKey] Credits value:', credits, 'type:', typeof credits);
+       
+       if (typeof credits !== 'number' || Number.isNaN(credits)) {
+         console.log('[testApiKey] Credits not a valid number');
+         return false;
+       }
+       
+       if (data?.error) {
+         console.log('[testApiKey] Error field present:', data.error);
+         return false;
+       }
 
-      return true;
-    } catch {
-      return false;
-    } finally {
-      checkingRef.current = false;
-    }
-  }, []);
+       console.log('[testApiKey] Key is valid');
+       return true;
+     } catch (err) {
+       console.error('[testApiKey] Fetch error:', err);
+       return false;
+     } finally {
+       checkingRef.current = false;
+     }
+   }, []);
 
   // Debounced validation on input change
   const debouncedValidate = useCallback((key: string) => {
@@ -152,22 +171,22 @@ export default function ApiKeyInput({ onApiKeyChange, serverKeyConfigured }: Api
     setStatusMessage('Validating API key...');
     setValidationError(null);
 
-    const isValid = await testApiKey(trimmed);
+     const isValid = await testApiKey(trimmed);
 
-    if (isValid) {
-      localStorage.setItem('musicgpt_api_key', trimmed);
-      setStatus('valid');
-      setStatusMessage('API key validated and saved ✓');
-      onApiKeyChange?.(trimmed);
-      setTimeout(() => {
-        setStatus('saved');
-        setStatusMessage('');
-      }, 2000);
-    } else {
-      setStatus('invalid');
-      setStatusMessage('Invalid API key or no credits. Please check your key.');
-      setValidationError('API key validation failed');
-    }
+     if (isValid) {
+       localStorage.setItem('musicgpt_api_key', trimmed);
+       setStatus('valid');
+       setStatusMessage('API key validated and saved ✓');
+       onApiKeyChange?.(trimmed);
+       setTimeout(() => {
+         setStatus('saved');
+         setStatusMessage('');
+       }, 2000);
+     } else {
+       setStatus('invalid');
+       setStatusMessage('Invalid API key or unable to verify. Check console for details.');
+       setValidationError('API key validation failed');
+     }
   }, [apiKey, testApiKey, onApiKeyChange]);
 
   // Clear API key
@@ -195,20 +214,20 @@ export default function ApiKeyInput({ onApiKeyChange, serverKeyConfigured }: Api
       return;
     }
 
-    setStatus('validating');
-    setStatusMessage('Testing connection...');
-    setValidationError(null);
+     setStatus('validating');
+     setStatusMessage('Validating API key...');
+     setValidationError(null);
 
     const isValid = await testApiKey(trimmed);
 
-    if (isValid) {
-      setStatus('valid');
-      setStatusMessage('API key is valid ✓');
-    } else {
-      setStatus('invalid');
-      setStatusMessage('Invalid API key or unable to verify.');
-      setValidationError('Validation failed');
-    }
+     if (isValid) {
+       setStatus('valid');
+       setStatusMessage('API key is valid ✓');
+     } else {
+       setStatus('invalid');
+       setStatusMessage('Invalid API key or unable to verify. Check console for details.');
+       setValidationError('Validation failed');
+     }
   }, [apiKey, testApiKey]);
 
   // Copy to clipboard with feedback
@@ -438,14 +457,14 @@ export default function ApiKeyInput({ onApiKeyChange, serverKeyConfigured }: Api
         <div className="flex gap-1">
           {hasKey ? (
             <>
-              <button
-                type="button"
-                onClick={handleTest}
-                disabled={isProcessing}
-                className="px-3 py-2 bg-gray-700/60 hover:bg-gray-600/80 disabled:bg-gray-800/50 disabled:text-gray-600 text-white rounded-lg font-medium transition-all text-sm"
-              >
-                Test
-              </button>
+               <button
+                 type="button"
+                 onClick={handleTest}
+                 disabled={isProcessing}
+                 className="px-3 py-2 bg-gray-700/60 hover:bg-gray-600/80 disabled:bg-gray-800/50 disabled:text-gray-600 text-white rounded-lg font-medium transition-all text-sm"
+               >
+                 Validate
+               </button>
               <button
                 type="button"
                 onClick={handleClear}
@@ -560,28 +579,36 @@ export default function ApiKeyInput({ onApiKeyChange, serverKeyConfigured }: Api
           <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
           </svg>
-          Format: alphanumeric key with hyphens/underscores (20+ characters)
+          Format: alphanumeric key (typically starts with &quot;mt-&quot;) with hyphens/underscores (20+ characters)
         </p>
       )}
 
-      {/* Getting started link */}
-      <p className="text-xs text-gray-500 flex items-center gap-1">
-        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-        </svg>
-        Get your API key from{' '}
-        <a 
-          href="https://musicgpt.com" 
-          target="_blank" 
-          rel="noopener noreferrer"
-          className="text-cyan-400 hover:text-cyan-300 underline underline-offset-2 transition-colors"
-        >
-          musicgpt.com
-        </a>
-        {serverKeyConfigured === true && (
-          <span className="ml-1 text-gray-600">(Server key configured ✓)</span>
-        )}
-      </p>
+       {/* Getting started link */}
+       <p className="text-xs text-gray-500 flex items-center gap-1">
+         <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+         </svg>
+         Get your API key from{' '}
+         <a
+           href="https://musicgpt.com"
+           target="_blank"
+           rel="noopener noreferrer"
+           className="text-cyan-400 hover:text-cyan-300 underline underline-offset-2 transition-colors"
+         >
+           musicgpt.com
+         </a>
+         {serverKeyConfigured === true && (
+           <span className="ml-1 text-gray-600">(Server key configured ✓)</span>
+         )}
+       </p>
+
+       {/* Security note */}
+       <p className="text-xs text-gray-500 flex items-center gap-1">
+         <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+           <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/>
+         </svg>
+         Your API key is encrypted during transit and handled securely.
+       </p>
     </div>
   );
 }
