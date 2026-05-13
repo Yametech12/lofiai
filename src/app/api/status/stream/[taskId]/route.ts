@@ -1,23 +1,55 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { mapConversionToTracks, buildFailed } from '@/lib/trackUtils';
+import { MUSICGPT_CONFIG, CONVERSION_TYPE } from '@/lib/config';
+import {
+  FETCH_RETRY_ATTEMPTS,
+  FETCH_RETRY_BACKOFF_MS,
+  STREAM_FETCH_TIMEOUT_MS,
+  POLL_INTERVAL_MS,
+  MESSAGE_PROCESSING_DEFAULT,
+  ERROR_API_KEY_MISSING,
+  ERROR_API_KEY_INVALID,
+  ERROR_NETWORK,
+  ERROR_GENERATION_FAILED,
+} from '@/lib/constants';
 
-const MUSICGPT_STATUS_URL = 'https://api.musicgpt.com/api/public/v1/byId';
+const MUSICGPT_STATUS_URL = `${MUSICGPT_CONFIG.BASE_URL}${MUSICGPT_CONFIG.STATUS_PATH}`;
+
+async function fetchWithRetry(url: string, options: RequestInit, retries = FETCH_RETRY_ATTEMPTS, backoff = FETCH_RETRY_BACKOFF_MS) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), STREAM_FETCH_TIMEOUT_MS);
+      const resp = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeout);
+      return resp;
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, backoff * Math.pow(2, attempt)));
+      }
+    }
+  }
+  throw lastError;
+}
 
 async function fetchStatusWithKey(apiKey: string, taskId: string) {
-  const url = new URL(MUSICGPT_STATUS_URL, 'https://api.musicgpt.com');
-  url.searchParams.set('conversionType', 'MUSIC_AI');
+  const url = new URL(MUSICGPT_STATUS_URL);
+  url.searchParams.set('conversionType', CONVERSION_TYPE);
   url.searchParams.set('task_id', taskId);
 
-  const response = await fetch(url.toString(), {
+  const response = await fetchWithRetry(url.toString(), {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
-    signal: AbortSignal.timeout(25_000),
   });
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
+    const retryAfter = response.headers.get('Retry-After');
     throw {
       status: response.status,
       message:
@@ -25,66 +57,14 @@ async function fetchStatusWithKey(apiKey: string, taskId: string) {
         (data as { message?: string; error?: string }).error ||
         `MusicGPT API error: ${response.status}`,
       data,
+      retryAfter: retryAfter ? parseInt(retryAfter, 10) : null,
     };
   }
 
   return await response.json();
 }
 
-function mapConversionToTracks(conversion: unknown) {
-  const c = conversion as {
-    conversion_path_1?: string | null;
-    conversion_path_wav_1?: string | null;
-    title_1?: string | null;
-    conversion_duration_1?: number | null;
 
-    conversion_path_2?: string | null;
-    conversion_path_wav_2?: string | null;
-    title_2?: string | null;
-    conversion_duration_2?: number | null;
-
-    status_msg?: string;
-    status?: string;
-    music_style?: string | null;
-  };
-
-  const v1 = {
-    version: 'v1' as const,
-    url: c.conversion_path_1 ?? null,
-    wavUrl: c.conversion_path_wav_1 ?? null,
-    title: c.title_1 ?? null,
-    duration: c.conversion_duration_1 ?? null,
-  };
-
-  const v2 = {
-    version: 'v2' as const,
-    url: c.conversion_path_2 ?? null,
-    wavUrl: c.conversion_path_wav_2 ?? null,
-    title: c.title_2 ?? null,
-    duration: c.conversion_duration_2 ?? null,
-  };
-
-  const tracks: Array<{
-    version: 'v1' | 'v2';
-    url: string | null;
-    wavUrl: string | null;
-    title: string | null;
-    duration: number | null;
-  }> = [];
-
-  if (v1.url || v1.wavUrl || v1.title) tracks.push(v1);
-  if (v2.url || v2.wavUrl || v2.title) tracks.push(v2);
-  if (tracks.length === 0) return [v1];
-  return tracks;
-}
-
-function buildFailed(statusMsg: string | undefined) {
-  return {
-    status: 'failed',
-    progress: 0,
-    error: statusMsg || 'Generation failed',
-  };
-}
 
 function formatSseMessage(payload: unknown, event = 'message') {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -105,7 +85,7 @@ export async function GET(
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
-      const send = (data: unknown, event?: string) => {
+      const send = (data: unknown, event = 'message') => {
         try {
           controller.enqueue(encoder.encode(formatSseMessage(data, event)));
         } catch {
@@ -113,27 +93,31 @@ export async function GET(
         }
       };
 
-      // SSE headers are set via NextResponse below.
       send({ status: 'processing', progress: 0, message: 'Starting stream...' });
 
       const abort = new AbortController();
-      const intervalMs = 2000;
+      const intervalMs = POLL_INTERVAL_MS;
 
-  const sendFinalAndClose = (data: unknown) => {
-    // Use default 'message' event so client's EventSource listener receives it
-    send(data);
-    try { controller.close(); } catch {}
-    abort.abort();
-  };
+      // When client disconnects, abort our polling
+      const onRequestAbort = () => abort.abort();
+      request.signal.addEventListener('abort', onRequestAbort);
+      if (request.signal.aborted) {
+        abort.abort();
+      }
+
+      const sendFinalAndClose = (data: unknown) => {
+        send(data);
+        try { controller.close(); } catch {}
+        abort.abort();
+      };
 
       const pollOnce = async () => {
         try {
-          // User key path
           if (userApiKey) {
             const data = await fetchStatusWithKey(userApiKey, taskId);
 
             if (!data?.success) {
-              sendFinalAndClose(buildFailed(data?.message || data?.error));
+              sendFinalAndClose(buildFailed(data?.message || data?.error || ERROR_GENERATION_FAILED));
               return;
             }
 
@@ -170,7 +154,7 @@ export async function GET(
             send({
               status: 'processing',
               progress: 50,
-              message: conversion.status_msg || 'Processing...',
+              message: conversion.status_msg || MESSAGE_PROCESSING_DEFAULT,
             });
             return;
           }
@@ -178,36 +162,60 @@ export async function GET(
           sendFinalAndClose({
             status: 'failed',
             progress: 0,
-            error: 'MusicGPT API key missing. Add your key in the web UI (settings panel).',
+            error: ERROR_API_KEY_MISSING,
           });
         } catch (error: unknown) {
-          const err = error as { status?: number; message?: string };
-          if (err?.status === 401) {
+          const err = error as { status?: number; message?: string; retryAfter?: number };
+          const status = err?.status || 500;
+
+          if (status === 401) {
             sendFinalAndClose({
               status: 'failed',
               progress: 0,
-              error: 'Invalid API key. Please check your MusicGPT API key.',
+              error: ERROR_API_KEY_INVALID,
             });
             return;
           }
 
+          if (status === 429) {
+            sendFinalAndClose({
+              status: 'failed',
+              progress: 0,
+              error: `MusicGPT rate limit: ${err?.message || 'Too many requests'}.${err?.retryAfter ? ` Try again in ${err.retryAfter}s.` : ''}`,
+            });
+            return;
+          }
+
+          const message = err?.message || 'Internal server error';
+          const isNetworkError = message.includes('fetch failed') || message.includes('ETIMEDOUT') || message.includes('ECONNREFUSED') || message.includes('ENOTFOUND') || message.includes('ConnectTimeoutError');
           sendFinalAndClose({
-            status: 'failed',
-            progress: 0,
-            error: err?.message || 'Internal server error',
+            error: isNetworkError ? ERROR_NETWORK : message
           });
         }
       };
 
-      // Poll immediately, then at interval.
+      // Perform first poll
       await pollOnce();
 
+      // If already aborted (e.g., client disconnected), do not set up interval
+      if (abort.signal.aborted) {
+        // Ensure listener removed to avoid leaks
+        request.signal.removeEventListener('abort', onRequestAbort);
+        return;
+      }
+
+      // Set up polling interval
       const timer = setInterval(() => {
         if (abort.signal.aborted) return;
         pollOnce();
       }, intervalMs);
 
-      abort.signal.addEventListener('abort', () => clearInterval(timer));
+      // Clear interval when abort signal fires
+      abort.signal.addEventListener('abort', () => {
+        clearInterval(timer);
+        // Also clean up the request abort listener
+        request.signal.removeEventListener('abort', onRequestAbort);
+      });
     },
   });
 
@@ -216,7 +224,6 @@ export async function GET(
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
-      // Ensure EventSource can read
       'Access-Control-Allow-Origin': '*',
     },
   });

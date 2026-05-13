@@ -1,21 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { MUSICGPT_ENDPOINTS } from '@/lib/config';
+import {
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_WINDOW_MS,
+  FETCH_RETRY_ATTEMPTS,
+  FETCH_RETRY_BACKOFF_MS,
+  FETCH_TIMEOUT_MS,
+  MAX_NUM_OUTPUTS,
+  MIN_NUM_OUTPUTS,
+  ERROR_RATE_LIMITED,
+  ERROR_PROMPT_REQUIRED,
+  ERROR_API_KEY_MISSING,
+  ERROR_API_KEY_INVALID,
+  ERROR_INSUFFICIENT_CREDITS,
+  ERROR_NETWORK,
+  ERROR_TIMEOUT,
+  ERROR_INVALID_REQUEST,
+} from '@/lib/constants';
 
-const MUSICGPT_API_URL = 'https://api.musicgpt.com/api/public/v1/MusicAI';
-
-
-// Simple in-memory rate limiting: IP -> { count, resetAt }
+// Rate limiting storage
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
-const RATE_LIMIT = 5;
-const RATE_WINDOW_MS = 60_000;
 
 function isRateLimited(ip: string): boolean {
   const now = Date.now();
   const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
     return false;
   }
-  if (entry.count >= RATE_LIMIT) return true;
+  if (entry.count >= RATE_LIMIT_MAX) return true;
   entry.count++;
   return false;
 }
@@ -23,6 +36,25 @@ function isRateLimited(ip: string): boolean {
 function getClientIp(request: NextRequest): string {
   return request.headers.get('x-forwarded-for')?.split(',')[0].trim()
     || request.headers.get('x-real-ip') || 'unknown';
+}
+
+async function fetchWithRetry(url: string, options: RequestInit, retries = FETCH_RETRY_ATTEMPTS, backoff = FETCH_RETRY_BACKOFF_MS) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      const resp = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeout);
+      return resp;
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, backoff * Math.pow(2, attempt)));
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function sendGenerationRequest(
@@ -37,7 +69,7 @@ async function sendGenerationRequest(
   output_length?: string,
   num_outputs?: string
 ) {
-  const response = await fetch(MUSICGPT_API_URL, {
+  const response = await fetchWithRetry(MUSICGPT_ENDPOINTS.GENERATE, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${apiKey}`,
@@ -52,17 +84,18 @@ async function sendGenerationRequest(
       ...(voice_id && { voice_id }),
       ...(webhook_url && { webhook_url }),
       ...(output_length && { output_length: output_length === '15' ? '15' : output_length === '60' ? '60' : '30' }),
-      ...(num_outputs && { num_outputs: Math.min(4, Math.max(1, parseInt(num_outputs, 10))) }),
+      ...(num_outputs && { num_outputs: Math.min(MAX_NUM_OUTPUTS, Math.max(MIN_NUM_OUTPUTS, parseInt(num_outputs, 10))) }),
     }),
-    signal: AbortSignal.timeout(30_000),
   });
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
+    const retryAfter = response.headers.get('Retry-After');
     throw {
       status: response.status,
       message: data.message || data.error || `MusicGPT API error: ${response.status}`,
       data,
+      retryAfter: retryAfter ? parseInt(retryAfter, 10) : null,
     };
   }
 
@@ -83,20 +116,23 @@ export async function POST(request: NextRequest) {
   try {
     const ip = getClientIp(request);
     if (isRateLimited(ip)) {
-      return NextResponse.json({ error: 'Too many requests. Please wait a minute.' }, { status: 429 });
+      return NextResponse.json(
+        { error: ERROR_RATE_LIMITED, rateLimit: { remaining: 0, resetMs: Date.now() + RATE_LIMIT_WINDOW_MS } },
+        { status: 429 }
+      );
     }
 
     const { prompt, music_style, lyrics, make_instrumental, vocal_only, voice_id, webhook_url, output_length, num_outputs, userApiKey } = await request.json();
 
     if (!prompt) {
-      return NextResponse.json({ error: 'Prompt is required' }, { status: 400 });
+      return NextResponse.json({ error: ERROR_PROMPT_REQUIRED }, { status: 400 });
     }
 
     const userKey = userApiKey?.trim() || null;
 
     if (!userKey) {
       return NextResponse.json(
-        { error: 'MusicGPT API key missing. Add your key in the web UI (settings panel).' },
+        { error: ERROR_API_KEY_MISSING },
         { status: 401 }
       );
     }
@@ -132,38 +168,45 @@ export async function POST(request: NextRequest) {
       });
     } catch (error: unknown) {
       if (error instanceof Error && error.name === 'TimeoutError') {
-        return NextResponse.json({ error: 'Request timed out. Please try again.' }, { status: 504 });
+        return NextResponse.json({ error: ERROR_TIMEOUT }, { status: 504 });
       }
 
-      const errorObj = error as { status?: number; message?: string; data?: unknown };
+      const errorObj = error as { status?: number; message?: string; data?: unknown; retryAfter?: number };
 
       if (errorObj.status === 401) {
         return NextResponse.json(
-          { error: 'Invalid API key. Please check your MusicGPT API key in settings.' },
+          { error: ERROR_API_KEY_INVALID },
           { status: 401 }
         );
       }
 
       if (errorObj.status === 402) {
         return NextResponse.json(
-          { error: 'Insufficient credits. Please check your MusicGPT account.' },
+          { error: ERROR_INSUFFICIENT_CREDITS },
           { status: 402 }
         );
       }
 
       if (errorObj.status === 429) {
         return NextResponse.json(
-          { error: 'MusicGPT rate limit hit. Please wait and try again.' },
+          {
+            error: errorObj.message || 'MusicGPT rate limit hit. Try again later.',
+            rateLimit: errorObj.retryAfter ? { remaining: 0, resetMs: Date.now() + errorObj.retryAfter * 1000 } : undefined
+          },
           { status: 429 }
         );
       }
 
-      console.error('Error in generate API (user key):', error);
-      return NextResponse.json({ error: errorObj.message || 'Internal server error' }, { status: 500 });
+      // Fallback: unexpected error
+      const message = errorObj.message || String(error);
+      const isNetworkError = message.includes('fetch failed') || message.includes('ETIMEDOUT') || message.includes('ECONNREFUSED') || message.includes('ENOTFOUND') || message.includes('ConnectTimeoutError');
+      console.error('Error in generate API (user key):', error, 'network:', isNetworkError);
+      return NextResponse.json({
+        error: isNetworkError ? ERROR_NETWORK : message
+      }, { status: isNetworkError ? 503 : 500 });
     }
-  } catch (error) {
-
-    console.error('Error parsing request:', error);
-    return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
-  }
+    } catch (error) {
+      console.error('Error parsing request:', error);
+      return NextResponse.json({ error: ERROR_INVALID_REQUEST }, { status: 400 });
+    }
 }

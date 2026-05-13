@@ -1,7 +1,32 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect } from 'react';
-import ApiKeySettings from '@/components/ApiKeySettings';
+import ApiKeyInput from '@/components/ApiKeyInput';
+import {
+  FEATURED_PROMPTS,
+  PROMPT_TEMPLATES,
+  STYLE_SUGGESTIONS,
+  MAX_POLL_ATTEMPTS,
+  POLL_INTERVAL_MS,
+  STORAGE_KEY_HISTORY,
+  MAX_HISTORY_ENTRIES,
+  LOW_CREDITS_THRESHOLD,
+  CREDITS_PER_SECOND,
+  DURATION_15S,
+  DURATION_30S,
+  DURATION_60S,
+  MAX_PROMPT_LENGTH,
+  MAX_NUM_OUTPUTS,
+  MIN_NUM_OUTPUTS,
+  ERROR_DISMISS_DELAY_MS,
+  ERROR_CLEAR_DELAY_MS,
+  MESSAGE_BEFORE_UNLOAD_GENERATING,
+  MESSAGE_PROCESSING_DEFAULT,
+  MESSAGE_SMART_EXPAND_TEMPLATE,
+  MAX_PROGRESS_PERCENT,
+  MIN_WORD_COUNT,
+  SMART_EXPAND_MAX_WORDS,
+} from '@/lib/constants';
 
 type GenerationStatus = 'idle' | 'generating' | 'polling' | 'completed' | 'error';
 
@@ -20,58 +45,14 @@ interface HistoryEntry {
   musicStyle?: string;
   makeInstrumental?: boolean;
   title: string | null;
-  tracks: Track[];
-  createdAt: number;
-}
+    tracks: Track[];
+    createdAt: number;
+  }
 
-const FEATURED_PROMPTS = [
-  { label: '🌧️ Rainy Night', prompt: 'Rainy night in Tokyo with vinyl crackle, mellow piano, and soft boom-bap drums', style: 'Lo-Fi Hip Hop' },
-  { label: '☕ Coffee Shop', prompt: 'Cozy coffee shop ambience with fingerstyle guitar, lo-fi beats, and warm sunlight through windows', style: 'Lo-Fi Chill' },
-  { label: '📚 Late Night Study', prompt: 'Late night study session with soft ambient pads, gentle rain, warm bass, and subtle vinyl texture', style: 'Ambient Lo-Fi' },
-  { label: '🚗 Nostalgic Drive', prompt: 'Nostalgic late night highway drive with dreamy synths, slow drums, and rain on the windshield', style: 'Synthwave Lo-Fi' },
-  { label: '☀️ Morning Jazz', prompt: 'Soft morning jazz café with upright bass, gentle brush drums, Rhodes piano, and rain outside', style: 'Jazz Lo-Fi' },
-  { label: '🌊 Ocean Breeze', prompt: 'Relaxing ocean waves with ukulele, soft sea breeze ambience, and mellow lo-fi rhythm', style: 'Tropical Lo-Fi' },
-  { label: '🏙️ Urban Twilight', prompt: 'Urban twilight cityscape with neon reflections, calm lo-fi beats, and gentle rainfall', style: 'Chillhop' },
-  { label: '🌙 Midnight Dream', prompt: 'Floating through a midnight dreamscape with ethereal synths, soft trap hats, and warm pads', style: 'Dreamy Lo-Fi' },
-];
-
-// Prompt auto-expansion templates
-const PROMPT_TEMPLATES: Record<string, string> = {
-  rainy: 'rainy night in Tokyo, vinyl crackle, mellow piano chords, soft boom-bap drums, lo-fi aesthetic, 75 BPM',
-  night: 'late night cityscape, ambient synth pads, gentle rainfall, warm vinyl warmth, dreamy atmosphere',
-  coffee: 'cozy coffee shop ambience, fingerstyle guitar, subtle cup clinks, warm sunlight, relaxed mood',
-  study: 'late night study session, soft ambient pads, gentle rain sounds, warm bass tones, focused energy',
-  jazz: 'smooth jazz café, upright bass, brush drums, Rhodes piano, intimate room ambience',
-  drive: 'nostalgic highway drive, dreamy synth leads, slow trap hats, rain on windshield, sunset glow',
-  ocean: 'ocean waves washing ashore, ukulele strums, sea breeze ambience, tropical lofi rhythm',
-  urban: 'urban twilight cityscape, neon light reflections, calm lo-fi beats, distant traffic hum',
-  piano: 'solo piano lofi, soft key presses, room ambience, warm tape saturation, peaceful mood',
-  guitar: 'acoustic guitar fingerstyle, warm bedside recording, vinyl crackle, gentle strums, cozy vibe',
-};
-
-const STYLE_SUGGESTIONS = [
-  'Lo-Fi Hip Hop', 'Lo-Fi Chill', 'Ambient Lo-Fi', 'Jazz Lo-Fi',
-  'Synthwave Lo-Fi', 'Chillhop', 'Dreamy Lo-Fi', 'Vaporwave',
-  'Boombap', 'Jazzy Hip Hop', 'Chillwave', 'Bedroom Pop',
-];
-
-const MAX_POLL_ATTEMPTS = 120; // Increased from 60 to 120 (4 minutes total)
-const POLL_INTERVAL_MS = 2000;
-const HISTORY_KEY = 'ghostname_history';
-const MAX_HISTORY = 5;
-const LOW_CREDITS_THRESHOLD = 1.0;
-
-// Credit cost estimates per second (rough approximation)
-const CREDITS_PER_SECOND = {
-  '15': 0.0053,  // ~$0.08 for 15s
-  '30': 0.005,   // ~$0.15 for 30s
-  '60': 0.0047,  // ~$0.28 for 60s
-};
-
-function estimateCost(numOutputs: number, duration: string): number {
-  const base = CREDITS_PER_SECOND[duration as keyof typeof CREDITS_PER_SECOND] || 0.005;
-  return Math.round((numOutputs * base * 100) / 100);
-}
+  function estimateCost(numOutputs: number, duration: string): number {
+    const base = CREDITS_PER_SECOND[duration as keyof typeof CREDITS_PER_SECOND] || 0.005;
+    return Math.round((numOutputs * base * 100) / 100);
+  }
 
 function formatDuration(secs: number | null): string {
   if (!secs || isNaN(secs)) return '0:00';
@@ -157,6 +138,7 @@ export default function Home() {
   const [eta, setEta] = useState<number | null>(null);
   const [credits, setCredits] = useState<number | null>(null);
   const [creditsLoadFailed, setCreditsLoadFailed] = useState(false);
+  const [serverKeyConfigured, setServerKeyConfigured] = useState<boolean | null>(null); // null = unknown, true/false = known
   const [tracks, setTracks] = useState<Track[]>([]);
   const [activeTrackIndex, setActiveTrackIndex] = useState(0);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -174,7 +156,7 @@ export default function Home() {
 
   useEffect(() => {
     try {
-      const stored = localStorage.getItem(HISTORY_KEY);
+      const stored = localStorage.getItem(STORAGE_KEY_HISTORY);
       if (!stored) return;
       // Avoid sync state updates directly in effect body (lint rule)
       queueMicrotask(() => {
@@ -196,44 +178,45 @@ export default function Home() {
    const [errorDetails, setErrorDetails] = useState<string | null>(null);
    const [shouldRefreshAudioKey, setShouldRefreshAudioKey] = useState(false);
    const [isLooping, setIsLooping] = useState(false);
-  const [retryCount, setRetryCount] = useState(0);
+   const [retryCount, setRetryCount] = useState(0);
   const [hasInteracted, setHasInteracted] = useState(false);
   const [isPreview, setIsPreview] = useState(false);
   const [upgradeAvailable, setUpgradeAvailable] = useState(false);
 
-    // Auto-dismiss errors after 8 seconds
+    // Auto-dismiss errors after configured delay
     useEffect(() => {
       if (error && showErrorBanner) {
         const timer = setTimeout(() => {
           setShowErrorBanner(false);
           setErrorDetails(null);
-        }, 8000);
+        }, ERROR_DISMISS_DELAY_MS);
         return () => clearTimeout(timer);
       }
      }, [error, showErrorBanner]);
 
     // Warn before leaving if generation in progress
    useEffect(() => {
-     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-       if (status === 'polling' || status === 'generating') {
-         const message = 'A track is currently generating. Are you sure you want to leave?';
-         e.returnValue = message;
-         return message;
-       }
-     };
+      const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+        if (status === 'polling' || status === 'generating') {
+          const message = MESSAGE_BEFORE_UNLOAD_GENERATING;
+          e.returnValue = message;
+          return message;
+        }
+      };
 
      window.addEventListener('beforeunload', handleBeforeUnload);
      return () => window.removeEventListener('beforeunload', handleBeforeUnload);
    }, [status]);
 
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollIntervalRef = useRef<number | null>(null);
   const [pollAttempts, setPollAttempts] = useState(0);
-  const msgIntervalRef = useRef<NodeJS.Timeout | null>(null);
-   const eventSourceRef = useRef<EventSource | null>(null);
-   const sseStartTimeRef = useRef<number | null>(null);
-   const cancelSseRef = useRef<(() => void) | null>(null);
-   const generationCompleteRef = useRef(false);
+  const msgIntervalRef = useRef<number | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const sseStartTimeRef = useRef<number | null>(null);
+  const cancelSseRef = useRef<(() => void) | null>(null);
+  const generationCompleteRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const errorTimeoutRef = useRef<number | null>(null);
 
    const textareaRef = useRef<HTMLTextAreaElement>(null);
    const visualizationRef = useRef<HTMLCanvasElement>(null);
@@ -305,60 +288,77 @@ export default function Home() {
     }
   }, [showErrorBanner, status]);
 
-  // Fetch credits on mount (and when userApiKey becomes available)
-  useEffect(() => {
-    const fetchCredits = async () => {
-      try {
-        const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
-        const r = await fetch(url);
-        const d = await r.json();
-        if (d.credits != null) {
-          setCredits(d.credits);
-          setCreditsLoadFailed(false);
-        } else {
+    // Fetch credits on mount (and when userApiKey becomes available)
+    useEffect(() => {
+      const fetchCredits = async () => {
+        try {
+          const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
+          const r = await fetch(url);
+          const d = await r.json();
+          if (d.credits != null) {
+            setCredits(d.credits);
+            setCreditsLoadFailed(false);
+            // Valid credits from server key (userApiKey absent) indicates server key configured
+            if (!userApiKey) {
+              setServerKeyConfigured(true);
+            }
+          } else {
+            setCreditsLoadFailed(true);
+            // Only infer server key configuration when using server key (no userApiKey)
+            if (!userApiKey) {
+              const errLower = (d.error || '').toLowerCase();
+              if (errLower.includes('not configured') || errLower.includes('environment')) {
+                setServerKeyConfigured(false);
+              }
+            }
+          }
+        } catch {
           setCreditsLoadFailed(true);
         }
-      } catch {
-        setCreditsLoadFailed(true);
-      }
-    };
-
-    fetchCredits();
-  }, [userApiKey]);
-
-
-    // Cleanup on unmount - place after clearPoll definition to avoid forward ref
-    useEffect(() => {
-      return () => {
-        // Clear polling intervals
-        if (pollIntervalRef.current) {
-          clearInterval(pollIntervalRef.current);
-          pollIntervalRef.current = null;
-        }
-        if (msgIntervalRef.current) {
-          clearInterval(msgIntervalRef.current);
-          msgIntervalRef.current = null;
-        }
-
-        // Close SSE stream if active
-        if (eventSourceRef.current) {
-          try {
-            eventSourceRef.current.close();
-          } catch {}
-          eventSourceRef.current = null;
-        }
-
-        // Cancel any in-flight handlers
-        cancelSseRef.current?.();
-        cancelSseRef.current = null;
-        sseStartTimeRef.current = null;
-
-        // Close audio context
-        if (audioContextRef.current) {
-          audioContextRef.current.close();
-        }
       };
-    }, []);
+
+      fetchCredits();
+    }, [userApiKey]);
+
+
+     // Cleanup on unmount - place after clearPoll definition to avoid forward ref
+     useEffect(() => {
+       return () => {
+         // Clear polling intervals
+         if (pollIntervalRef.current) {
+           clearInterval(pollIntervalRef.current);
+           pollIntervalRef.current = null;
+         }
+         if (msgIntervalRef.current) {
+           clearInterval(msgIntervalRef.current);
+           msgIntervalRef.current = null;
+         }
+
+         // Clear error timeout
+         if (errorTimeoutRef.current) {
+           clearTimeout(errorTimeoutRef.current);
+           errorTimeoutRef.current = null;
+         }
+
+         // Close SSE stream if active
+         if (eventSourceRef.current) {
+           try {
+             eventSourceRef.current.close();
+           } catch {}
+           eventSourceRef.current = null;
+         }
+
+         // Cancel any in-flight handlers
+         cancelSseRef.current?.();
+         cancelSseRef.current = null;
+         sseStartTimeRef.current = null;
+
+         // Close audio context
+         if (audioContextRef.current) {
+           audioContextRef.current.close();
+         }
+       };
+     }, []);
 
    // Audio Web API setup - wrapped to prevent crashes from CORS or browser issues
    useEffect(() => {
@@ -446,8 +446,8 @@ export default function Home() {
 
   const saveToHistory = useCallback((entry: HistoryEntry) => {
     setHistory((prev) => {
-      const updated = [entry, ...prev].slice(0, MAX_HISTORY);
-      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(updated)); } catch {}
+      const updated = [entry, ...prev].slice(0, MAX_HISTORY_ENTRIES);
+      try { localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(updated)); } catch {}
       return updated;
     });
   }, []);
@@ -457,7 +457,7 @@ export default function Home() {
 
     // Prompt quality validation
     const wordCount = prompt.trim().split(/\s+/).filter(w => w.length > 0).length;
-    if (wordCount < 3) {
+    if (wordCount < MIN_WORD_COUNT) {
       const errMsg = 'Please add more detail (at least 3 words) for better results. Try describing the mood, instruments, and setting.';
       setError(errMsg);
       setErrorDetails(errMsg);
@@ -490,33 +490,75 @@ export default function Home() {
     setTrackDuration(0);
     setShouldRefreshAudioKey((v) => !v);
     setUpgradeAvailable(false);
-    setIsPreview(outputLength === '15');
+    setIsPreview(outputLength === DURATION_15S);
     generationCompleteRef.current = false; // reset completion flag
 
-    try {
-      const response = await fetch('/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          music_style: musicStyle || undefined,
-          make_instrumental: makeInstrumental,
-          num_outputs: numOutputs.toString(),
-          output_length: outputLength,
-          userApiKey: userApiKey || undefined,
-        }),
-      });
+     try {
+       const response = await fetch('/api/generate', {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({
+           prompt,
+           music_style: musicStyle || undefined,
+           make_instrumental: makeInstrumental,
+           num_outputs: numOutputs.toString(),
+           output_length: outputLength,
+           userApiKey: userApiKey || undefined,
+         }),
+       });
 
-      const data = await response.json();
+       const data = await response.json();
 
-      if (!response.ok || !data.taskId) {
-        const errMsg = data.error || 'Failed to start generation';
-        setError(errMsg);
-        setErrorDetails(errMsg);
-        setShowErrorBanner(true);
-        setStatus('error');
-        return;
-      }
+       if (!response.ok || !data.taskId) {
+         const rawError = data.error || 'Failed to start generation';
+         const status = response.status;
+
+         // Provide helpful, actionable error messages
+         let errMsg = rawError;
+         let errorTitle = 'Generation Failed';
+
+         switch (status) {
+           case 401:
+             errorTitle = 'Invalid API Key';
+             errMsg = 'Your MusicGPT API key is invalid. Please check your key in the settings below and try again.';
+             break;
+           case 402:
+             errorTitle = 'Insufficient Credits';
+             errMsg = 'You do not have enough credits for this generation. Please add credits to your MusicGPT account.';
+             break;
+           case 429:
+             errorTitle = 'Rate Limit Exceeded';
+             const retryIn = data.rateLimit?.resetMs ? Math.ceil((data.rateLimit.resetMs - Date.now()) / 1000) : 'a few minutes';
+             errMsg = `You've hit the rate limit. Please try again in ${retryIn} seconds.`;
+             break;
+           case 503:
+             errorTitle = 'Service Unavailable';
+             errMsg = 'Cannot reach MusicGPT API. Check your network connection or try again later.';
+             break;
+           case 504:
+             errorTitle = 'Request Timeout';
+             errMsg = 'The request timed out. Please try again with a shorter prompt or smaller output.';
+             break;
+           case 500:
+             errorTitle = 'Server Error';
+             errMsg = 'An unexpected error occurred on our end. Please try again in a moment.';
+             break;
+           default:
+             // Use raw error for other cases
+             break;
+         }
+
+         // Append original error for debugging if it's more detailed
+         if (rawError && !errMsg.includes(rawError) && status >= 500) {
+           errMsg = `${errMsg}\n\nDetails: ${rawError}`;
+         }
+
+         setError(errorTitle);
+         setErrorDetails(errMsg);
+         setShowErrorBanner(true);
+         setStatus('error');
+         return;
+       }
 
       setTaskId(data.taskId);
       if (data.eta) setEta(data.eta);
@@ -582,15 +624,20 @@ export default function Home() {
               // Mark generation as complete to ignore subsequent SSE errors
               generationCompleteRef.current = true;
 
-              fetch('/api/credits')
-                .then((r) => r.json())
-                .then((d) => {
-                  if (d.credits != null) {
-                    setCredits(d.credits);
-                    setCreditsLoadFailed(false);
-                  }
-                })
-                .catch(() => {});
+               fetch('/api/credits')
+                 .then((r) => r.json())
+                 .then((d) => {
+                   if (d.credits != null) {
+                     setCredits(d.credits);
+                     setCreditsLoadFailed(false);
+                   }
+                 })
+                 .catch((err) => {
+                   // Silent failure acceptable — credits update is non-critical
+                   if (process.env.NODE_ENV === 'development') {
+                     console.debug('Credits refresh failed (non-critical):', err);
+                   }
+                 });
 
               saveToHistory({
                 id: Date.now().toString(),
@@ -606,7 +653,7 @@ export default function Home() {
               setRetryCount(0);
 
               // Offer upgrade to full quality if this was a preview
-              if (isPreview && outputLength === '15' && status !== 'error') {
+               if (isPreview && outputLength === DURATION_15S && status !== 'error') {
                 setIsPreview(false);
                 setUpgradeAvailable(true);
               }
@@ -626,16 +673,16 @@ export default function Home() {
               } catch {}
             } else {
               // Processing
-              const msg = statusData.message || 'Processing your request...';
+               const msg = statusData.message || MESSAGE_PROCESSING_DEFAULT;
               setProcessingMessage(String(msg));
 
 
-              setPollAttempts((prev) => {
-                const newAttempts = prev + 1;
-                const p = Math.min(85, newAttempts * 5);
-                setProgress(p);
-                return newAttempts;
-              });
+                setPollAttempts((prev) => {
+                 const newAttempts = prev + 1;
+                 const p = Math.min(MAX_PROGRESS_PERCENT, newAttempts * 5);
+                 setProgress(p);
+                 return newAttempts;
+               });
             }
           } catch {
             // Ignore malformed events
@@ -687,7 +734,13 @@ export default function Home() {
     setProgress(0);
     setProcessingMessage('');
     setIsPlaying(false);
-    setTimeout(() => setError(null), 3000);
+    if (errorTimeoutRef.current) {
+      clearTimeout(errorTimeoutRef.current);
+    }
+     errorTimeoutRef.current = window.setTimeout(() => {
+       setError(null);
+       errorTimeoutRef.current = null;
+     }, ERROR_CLEAR_DELAY_MS);
   }, [clearPoll]);
 
   const handleReset = useCallback(() => {
@@ -757,7 +810,7 @@ export default function Home() {
     }
   }, []);
 
-   const handleFeatured = useCallback((featured: typeof FEATURED_PROMPTS[0]) => {
+   const handleFeatured = useCallback((featured: typeof FEATURED_PROMPTS[number]) => {
      setPrompt(featured.prompt);
      setMusicStyle(featured.style);
      setMakeInstrumental(false);
@@ -779,13 +832,13 @@ export default function Home() {
       }
     }
 
-    // Generic expansion for short prompts (3-5 words)
-    const wordCount = prompt.split(/\s+/).filter(w => w.length > 0).length;
-    if (wordCount >= 2 && wordCount < 6) {
-      expanded = `${prompt}, lo-fi atmosphere, vinyl crackle warmth, soft textures, 75-85 BPM`;
-      setPrompt(expanded);
-      setHasInteracted(true);
-    }
+      // Generic expansion for short prompts (2-5 words)
+      const wordCount = prompt.split(/\s+/).filter(w => w.length > 0).length;
+      if (wordCount >= 2 && wordCount < SMART_EXPAND_MAX_WORDS) {
+        expanded = MESSAGE_SMART_EXPAND_TEMPLATE.replace('{prompt}', prompt);
+        setPrompt(expanded);
+        setHasInteracted(true);
+      }
   }, [prompt]);
 
   const handleCopyPrompt = useCallback(async () => {
@@ -957,11 +1010,11 @@ export default function Home() {
                   onChange={(e) => setOutputLength(e.target.value)}
                   disabled={isWorking}
                   className="w-full px-3 py-2 bg-gray-800/50 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-cyan-400 transition-all appearance-none cursor-pointer"
-                >
-                  <option value="15">15 seconds (fast)</option>
-                  <option value="30">30 seconds</option>
-                  <option value="60">60 seconds (high quality)</option>
-                </select>
+                 >
+                   <option value={DURATION_15S}>15 seconds (fast)</option>
+                   <option value={DURATION_30S}>30 seconds</option>
+                   <option value={DURATION_60S}>60 seconds (high quality)</option>
+                 </select>
               </div>
               <div>
                 <label htmlFor="num_outputs" className="block text-xs font-medium text-gray-400 mb-1">
@@ -971,8 +1024,8 @@ export default function Home() {
                   <input
                     id="num_outputs"
                     type="range"
-                    min="1"
-                    max="4"
+                    min={MIN_NUM_OUTPUTS}
+                    max={MAX_NUM_OUTPUTS}
                     value={numOutputs}
                     onChange={(e) => setNumOutputs(Number(e.target.value))}
                     disabled={isWorking}
@@ -983,23 +1036,22 @@ export default function Home() {
               </div>
             </div>
 
-             {/* Cost Estimator */}
-             {!isWorking && (
-               <div className="flex items-center justify-between p-3 bg-gradient-to-r from-gray-800/40 to-gray-900/40 rounded-lg border border-gray-700/50">
-                 <div className="flex flex-col">
-                   <span className="text-xs text-gray-400">Estimated cost</span>
-                   <span className="text-[10px] text-gray-500">
-                     ~{outputLength === '15' ? '15' : outputLength === '30' ? '30' : '60'}s × {numOutputs} {numOutputs === 1 ? 'track' : 'tracks'}
-                   </span>
-                 </div>
-                 <div className="text-right">
-                   <div className="text-lg font-bold text-cyan-400">
-                     ${estimateCost(numOutputs, outputLength).toFixed(2)}
-                   </div>
-                 </div>
-               </div>
-             )}
-        </div>
+            {/* Cost Estimator */}
+            {!isWorking && (
+                <div className="flex items-center justify-between p-3 bg-gradient-to-r from-gray-800/40 to-gray-900/40 rounded-lg border border-gray-700/50">
+                  <div className="flex flex-col">
+                    <span className="text-xs text-gray-400">Estimated cost</span>
+                     <span className="text-[10px] text-gray-500">
+                       ~{outputLength}s × {numOutputs} {numOutputs === 1 ? 'track' : 'tracks'}
+                    </span>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-lg font-bold text-cyan-400">
+                      ${estimateCost(numOutputs, outputLength).toFixed(2)}
+                    </div>
+                  </div>
+                </div>
+               )}
 
         {/* Error Banner - Enhanced */}
         {showErrorBanner && errorDetails && (
@@ -1077,7 +1129,7 @@ export default function Home() {
                 </svg>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium text-white truncate">{entry.title || entry.prompt.slice(0, 30)}</p>
-                  <p className="text-xs text-gray-500">{new Date(entry.createdAt).toLocaleTimeString()}</p>
+                  <p className="text-xs text-gray-500">{new Date(entry.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</p>
                 </div>
                 <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7"/>
@@ -1090,7 +1142,7 @@ export default function Home() {
         {/* Main Card - Enhanced */}
         <div className="relative group">
           {/* Glow effect */}
-          <div className="absolute -inset-0.5 bg-gradient-to-r from-cyan-500/20 via-purple-500/20 to-cyan-500/20 rounded-2xl blur opacity-30 group-hover:opacity-50 transition-opacity duration-500" />
+           <div className="absolute -inset-0.5 bg-gradient-to-r from-cyan-500/20 via-purple-500/20 to-cyan-500/20 rounded-2xl blur opacity-30 group-hover:opacity-50 transition-opacity duration-500 pointer-events-none" />
           
           <div className="relative bg-gray-900/90 backdrop-blur-xl border border-gray-800/50 rounded-2xl p-6 space-y-6 shadow-2xl">
             {/* Content remains the same */}
@@ -1114,7 +1166,7 @@ export default function Home() {
                     className="w-full p-4 pr-20 bg-gray-800/50 border border-gray-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-400 focus:border-transparent transition-all resize-none"
                     rows={3}
                     disabled={isWorking}
-                    maxLength={280}
+                    maxLength={MAX_PROMPT_LENGTH}
                     aria-label="Describe your track"
                   />
                   {prompt.trim() && (
@@ -1254,10 +1306,10 @@ export default function Home() {
 
            {/* Action Row */}
            <div className="flex gap-3">
-              <button
-                onClick={() => status === 'error' ? handleReset() : status === 'polling' ? handleCancel() : handleGenerate()}
-                disabled={status === 'generating' || (!prompt.trim() && status === 'idle')}
-                className={`
+               <button
+                 onClick={() => status === 'error' ? handleReset() : status === 'polling' ? handleCancel() : handleGenerate()}
+                 disabled={status === 'generating' || (!prompt.trim() && status === 'idle') || (status !== 'polling' && !userApiKey)}
+                 className={`
                   relative flex-1 py-4 rounded-xl font-semibold text-lg transition-all duration-200
                   ${status === 'generating'
                     ? 'bg-gray-700 cursor-not-allowed shadow-none'
@@ -1340,7 +1392,7 @@ export default function Home() {
                     <svg className="w-3 h-3 text-cyan-400 animate-pulse" fill="currentColor" viewBox="0 0 24 24">
                       <circle cx="12" cy="12" r="2"/>
                     </svg>
-                    {processingMessage || 'Processing your request...'}
+                    {processingMessage || MESSAGE_PROCESSING_DEFAULT}
                   </p>
                   {eta && (
                     <p className="text-gray-500">
@@ -1613,10 +1665,18 @@ export default function Home() {
                </div>
             </div>
           )}
-        </div>
+          </div>
+         </div>
 
-        {/* API Key Settings */}
-        <ApiKeySettings onApiKeyChange={setUserApiKey} />
+         {/* Server key not configured warning (only if user doesn't have a saved key) */}
+         {serverKeyConfigured === false && !userApiKey && (
+           <div className="mb-4 p-3 border border-orange-500/30 rounded-lg bg-orange-950/20 text-orange-200 text-xs">
+             <strong>Note:</strong> No server MusicGPT API key is configured. 
+             You must enter your own API key below to generate tracks.
+           </div>
+         )}
+
+          <ApiKeyInput onApiKeyChange={setUserApiKey} serverKeyConfigured={serverKeyConfigured} />
 
         {/* Footer */}
         <p className="text-center text-gray-500 text-sm">
