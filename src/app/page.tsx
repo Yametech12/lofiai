@@ -1657,13 +1657,7 @@ export default function Home() {
           </div>
          </div>
 
-         {/* Server key not configured warning (only if user doesn't have a saved key) */}
-         {serverKeyConfigured === false && !userApiKey && (
-           <div className="mb-4 p-3 border border-orange-500/30 rounded-lg bg-orange-950/20 text-orange-200 text-xs">
-             <strong>Note:</strong> No server MusicGPT API key is configured. 
-             You must enter your own API key below to generate tracks.
-           </div>
-         )}
+         {/* API key input — users always provide their own key */}
 
           <ApiKeyInput onApiKeyChange={setUserApiKey} serverKeyConfigured={serverKeyConfigured} />
 
