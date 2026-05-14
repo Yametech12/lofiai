@@ -39,13 +39,10 @@ export function mapConversionToTracks(conversion: unknown): Track[] {
     duration: c.conversion_duration_2 ?? null,
   };
 
-  const tracks: Track[] = [];
-
-  if (v1.url || v1.wavUrl || v1.title) tracks.push(v1);
-  if (v2.url || v2.wavUrl || v2.title) tracks.push(v2);
-
-  if (tracks.length === 0) return [v1];
-  return tracks;
+  // Always return both v1 and v2 placeholders.
+  // This way callers can detect when both are ready (vs only one being populated).
+  // Filtering happens at display time, not here.
+  return [v1, v2];
 }
 
 export function buildFailed(statusMsg: string | undefined) {
@@ -54,4 +51,36 @@ export function buildFailed(statusMsg: string | undefined) {
     progress: 0,
     error: statusMsg || 'Generation failed',
   };
+}
+
+/**
+ * Sort tracks v1-first, then v2, and return the preferred active index.
+ * Prefers v2 with a playable URL; falls back to first playable track.
+ *
+ * Generic over T so callers with looser shape variants (e.g. `version?: 'v1' | 'v2'`)
+ * can pass their own track types without forcing a structural cast.
+ */
+export function sortTracksAndPickActive<
+  T extends {
+    version?: 'v1' | 'v2' | string;
+    url?: string | null;
+    wavUrl?: string | null;
+  }
+>(tracks: T[]): { sorted: T[]; activeIndex: number } {
+  const sorted = [...tracks].sort((a, b) => {
+    if (a.version === b.version) return 0;
+    if (a.version === 'v1') return -1;
+    if (a.version === 'v2') return 1;
+    return 0;
+  });
+
+  let activeIndex = sorted.findIndex(
+    (t) => t.version === 'v2' && (t.url || t.wavUrl)
+  );
+  if (activeIndex < 0) {
+    activeIndex = sorted.findIndex((t) => t.url || t.wavUrl);
+  }
+  if (activeIndex < 0) activeIndex = 0;
+
+  return { sorted, activeIndex };
 }

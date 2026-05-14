@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import ApiKeyInput from '@/components/ApiKeyInput';
+import { sortTracksAndPickActive } from '@/lib/trackUtils';
 import {
   FEATURED_PROMPTS,
   PROMPT_TEMPLATES,
@@ -125,14 +126,13 @@ export default function Home() {
   const [prompt, setPrompt] = useState('');
   const [musicStyle, setMusicStyle] = useState('');
   const [makeInstrumental, setMakeInstrumental] = useState(false);
-  const [numOutputs, setNumOutputs] = useState(1);
+  const [numOutputs, setNumOutputs] = useState(2);
   const [outputLength, setOutputLength] = useState('30');
   const [userApiKey, setUserApiKey] = useState<string | null>(null);
   const [status, setStatus] = useState<GenerationStatus>('idle');
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
-  const [error, setError] = useState<string | null>(null);
   const [processingMessage, setProcessingMessage] = useState('');
   const [songTitle, setSongTitle] = useState<string | null>(null);
   const [eta, setEta] = useState<number | null>(null);
@@ -174,25 +174,21 @@ export default function Home() {
    const [trackDuration, setTrackDuration] = useState(0);
    const [isPlaying, setIsPlaying] = useState(false);
    const [volume, setVolume] = useState(1);
-   const [showErrorBanner, setShowErrorBanner] = useState(false);
-   const [errorDetails, setErrorDetails] = useState<string | null>(null);
-   const [shouldRefreshAudioKey, setShouldRefreshAudioKey] = useState(false);
+  // Consolidated error state — replaces separate error/errorDetails/showErrorBanner
+  const [appError, setAppError] = useState<{ title: string; details: string } | null>(null);
+  const [shouldRefreshAudioKey, setShouldRefreshAudioKey] = useState(false);
    const [isLooping, setIsLooping] = useState(false);
    const [retryCount, setRetryCount] = useState(0);
   const [hasInteracted, setHasInteracted] = useState(false);
-  const [isPreview, setIsPreview] = useState(false);
   const [upgradeAvailable, setUpgradeAvailable] = useState(false);
 
     // Auto-dismiss errors after configured delay
     useEffect(() => {
-      if (error && showErrorBanner) {
-        const timer = setTimeout(() => {
-          setShowErrorBanner(false);
-          setErrorDetails(null);
-        }, ERROR_DISMISS_DELAY_MS);
+      if (appError) {
+        const timer = setTimeout(() => setAppError(null), ERROR_DISMISS_DELAY_MS);
         return () => clearTimeout(timer);
       }
-     }, [error, showErrorBanner]);
+     }, [appError]);
 
     // Warn before leaving if generation in progress
    useEffect(() => {
@@ -280,31 +276,23 @@ export default function Home() {
     progressFillRef.current.style.width = `${progress}%`;
   }, [progress]);
 
-  // Animation for error state
-  useEffect(() => {
-    if (showErrorBanner && !status.startsWith('error')) {
-      const t = setTimeout(() => setShowErrorBanner(false), 5000);
-      return () => clearTimeout(t);
-    }
-  }, [showErrorBanner, status]);
+  // (error auto-dismiss handled above)
 
     // Fetch credits on mount (and when userApiKey becomes available)
     useEffect(() => {
       const fetchCredits = async () => {
         try {
-          const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
-          const r = await fetch(url);
+          const headers: HeadersInit = userApiKey
+            ? { Authorization: `Bearer ${userApiKey}` }
+            : {};
+          const r = await fetch('/api/credits', { headers });
           const d = await r.json();
           if (d.credits != null) {
             setCredits(d.credits);
             setCreditsLoadFailed(false);
-            // Valid credits from server key (userApiKey absent) indicates server key configured
-            if (!userApiKey) {
-              setServerKeyConfigured(true);
-            }
+            if (!userApiKey) setServerKeyConfigured(true);
           } else {
             setCreditsLoadFailed(true);
-            // Only infer server key configuration when using server key (no userApiKey)
             if (!userApiKey) {
               const errLower = (d.error || '').toLowerCase();
               if (errLower.includes('not configured') || errLower.includes('environment')) {
@@ -405,7 +393,7 @@ export default function Home() {
        analyserRef.current = null;
        gainNodeRef.current = null;
      };
-   }, [audioUrl]);
+   }, []); // Run once on mount — AudioContext is created once and reused
 
   // Sync volume with audio element and gain node
   useEffect(() => {
@@ -452,16 +440,16 @@ export default function Home() {
     });
   }, []);
 
+  const isPreviewRef = useRef(false);
+
   const handleGenerate = useCallback(async (isRetry: boolean = false) => {
     if (!prompt.trim()) return;
 
     // Prompt quality validation
     const wordCount = prompt.trim().split(/\s+/).filter(w => w.length > 0).length;
     if (wordCount < MIN_WORD_COUNT) {
-      const errMsg = 'Please add more detail (at least 3 words) for better results. Try describing the mood, instruments, and setting.';
-      setError(errMsg);
-      setErrorDetails(errMsg);
-      setShowErrorBanner(true);
+      const msg = 'Please add more detail (at least 3 words) for better results. Try describing the mood, instruments, and setting.';
+      setAppError({ title: 'Prompt Too Short', details: msg });
       setStatus('error');
       return;
     }
@@ -472,93 +460,89 @@ export default function Home() {
       setRetryCount(0);
     }
 
+    const isPreviewNow = outputLength === DURATION_15S;
+    isPreviewRef.current = isPreviewNow;
+
     clearPoll();
     setStatus('generating');
     setAudioUrl(null);
     setTaskId(null);
     setProgress(0);
-    setError(null);
-    setErrorDetails(null);
-    setShowErrorBanner(false);
+    setAppError(null);
     setSongTitle(null);
     setEta(null);
-     setTracks([]);
-     setActiveTrackIndex(-1);
-     setProcessingMessage('');
+    setTracks([]);
+    setActiveTrackIndex(-1);
+    setProcessingMessage('');
     setIsPlaying(false);
     setCurrentTime(0);
     setTrackDuration(0);
     setShouldRefreshAudioKey((v) => !v);
     setUpgradeAvailable(false);
-    setIsPreview(outputLength === DURATION_15S);
-    generationCompleteRef.current = false; // reset completion flag
+    generationCompleteRef.current = false;
 
-     try {
-       const response = await fetch('/api/generate', {
-         method: 'POST',
-         headers: { 'Content-Type': 'application/json' },
-         body: JSON.stringify({
-           prompt,
-           music_style: musicStyle || undefined,
-           make_instrumental: makeInstrumental,
-           num_outputs: numOutputs.toString(),
-           output_length: outputLength,
-           userApiKey: userApiKey || undefined,
-         }),
-       });
+    try {
+      const response = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          music_style: musicStyle || undefined,
+          make_instrumental: makeInstrumental,
+          num_outputs: numOutputs.toString(),
+          output_length: outputLength,
+          userApiKey: userApiKey || undefined,
+        }),
+      });
 
-       const data = await response.json();
+      const data = await response.json();
 
-       if (!response.ok || !data.taskId) {
-         const rawError = data.error || 'Failed to start generation';
-         const status = response.status;
+      if (!response.ok || !data.taskId) {
+        const rawError = data.error || 'Failed to start generation';
+        const httpStatus = response.status;
 
-         // Provide helpful, actionable error messages
-         let errMsg = rawError;
-         let errorTitle = 'Generation Failed';
+        let errMsg = rawError;
+        let errorTitle = 'Generation Failed';
 
-         switch (status) {
-           case 401:
-             errorTitle = 'Invalid API Key';
-             errMsg = 'Your MusicGPT API key is invalid. Please check your key in the settings below and try again.';
-             break;
-           case 402:
-             errorTitle = 'Insufficient Credits';
-             errMsg = 'You do not have enough credits for this generation. Please add credits to your MusicGPT account.';
-             break;
-           case 429:
-             errorTitle = 'Rate Limit Exceeded';
-             const retryIn = data.rateLimit?.resetMs ? Math.ceil((data.rateLimit.resetMs - Date.now()) / 1000) : 'a few minutes';
-             errMsg = `You've hit the rate limit. Please try again in ${retryIn} seconds.`;
-             break;
-           case 503:
-             errorTitle = 'Service Unavailable';
-             errMsg = 'Cannot reach MusicGPT API. Check your network connection or try again later.';
-             break;
-           case 504:
-             errorTitle = 'Request Timeout';
-             errMsg = 'The request timed out. Please try again with a shorter prompt or smaller output.';
-             break;
-           case 500:
-             errorTitle = 'Server Error';
-             errMsg = 'An unexpected error occurred on our end. Please try again in a moment.';
-             break;
-           default:
-             // Use raw error for other cases
-             break;
-         }
+        switch (httpStatus) {
+          case 401:
+            errorTitle = 'Invalid API Key';
+            errMsg = 'Your MusicGPT API key is invalid. Please check your key in the settings below and try again.';
+            break;
+          case 402:
+            errorTitle = 'Insufficient Credits';
+            errMsg = 'You do not have enough credits for this generation. Please add credits to your MusicGPT account.';
+            break;
+          case 429: {
+            errorTitle = 'Rate Limit Exceeded';
+            const retryIn = data.rateLimit?.resetMs ? Math.ceil((data.rateLimit.resetMs - Date.now()) / 1000) : 'a few minutes';
+            errMsg = `You've hit the rate limit. Please try again in ${retryIn} seconds.`;
+            break;
+          }
+          case 503:
+            errorTitle = 'Service Unavailable';
+            errMsg = 'Cannot reach MusicGPT API. Check your network connection or try again later.';
+            break;
+          case 504:
+            errorTitle = 'Request Timeout';
+            errMsg = 'The request timed out. Please try again with a shorter prompt or smaller output.';
+            break;
+          case 500:
+            errorTitle = 'Server Error';
+            errMsg = 'An unexpected error occurred on our end. Please try again in a moment.';
+            break;
+          default:
+            break;
+        }
 
-         // Append original error for debugging if it's more detailed
-         if (rawError && !errMsg.includes(rawError) && status >= 500) {
-           errMsg = `${errMsg}\n\nDetails: ${rawError}`;
-         }
+        if (rawError && !errMsg.includes(rawError) && httpStatus >= 500) {
+          errMsg = `${errMsg}\n\nDetails: ${rawError}`;
+        }
 
-         setError(errorTitle);
-         setErrorDetails(errMsg);
-         setShowErrorBanner(true);
-         setStatus('error');
-         return;
-       }
+        setAppError({ title: errorTitle, details: errMsg });
+        setStatus('error');
+        return;
+      }
 
       setTaskId(data.taskId);
       if (data.eta) setEta(data.eta);
@@ -566,12 +550,13 @@ export default function Home() {
       setProgress(0);
       setPollAttempts(0);
 
-      // SSE stream (realtime-ish updates via server push)
+      // SSE stream — pass API key via Authorization header using a fetch-based approach
+      // EventSource doesn't support custom headers, so we keep the query param here
+      // but the server also accepts the Authorization header for non-EventSource clients.
       const streamUrl = userApiKey
         ? `/api/status/stream/${data.taskId}?userApiKey=${encodeURIComponent(userApiKey)}`
         : `/api/status/stream/${data.taskId}`;
 
-      // Keep a timer to enforce a max duration similar to old polling.
       if (sseStartTimeRef.current == null) sseStartTimeRef.current = Date.now();
 
       const sseTimer = setInterval(() => {
@@ -580,19 +565,14 @@ export default function Home() {
         const elapsedMs = Date.now() - startedAt;
         if (elapsedMs >= MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS) {
           clearInterval(sseTimer);
-          try {
-            eventSourceRef.current?.close();
-          } catch {}
+          try { eventSourceRef.current?.close(); } catch {}
           clearPoll();
-          setShowErrorBanner(true);
-          setError('Generation timed out. Please try again.');
+          setAppError({ title: 'Timed Out', details: 'Generation timed out. Please try again.' });
           setStatus('error');
         }
       }, 1000);
 
-      cancelSseRef.current = () => {
-        clearInterval(sseTimer);
-      };
+      cancelSseRef.current = () => { clearInterval(sseTimer); };
 
       try {
         const es = new EventSource(streamUrl);
@@ -602,56 +582,42 @@ export default function Home() {
           try {
             const statusData = JSON.parse(ev.data) as Record<string, unknown>;
 
-
             if (statusData.status === 'completed' && typeof statusData.audioUrl === 'string' && statusData.audioUrl) {
-
               clearInterval(sseTimer);
               clearPoll();
 
-               const allTracks = Array.isArray(statusData.tracks) ? (statusData.tracks as Track[]) : [];
+              const allTracks = Array.isArray(statusData.tracks) ? (statusData.tracks as Track[]) : [];
+              const { sorted: sortedTracks, activeIndex } = sortTracksAndPickActive(allTracks);
 
-               // Ensure consistent ordering: v1 first, then v2
-               const sortedTracks = [...allTracks].sort((a, b) => {
-                 if (a.version === b.version) return 0;
-                 if (a.version === 'v1') return -1;
-                 if (a.version === 'v2') return 1;
-                 return 0;
-               });
-               // Prefer v2 with valid URL as default, else first track with a URL
-               let activeIndex = sortedTracks.findIndex(t => t.version === 'v2' && (t.url || t.wavUrl));
-               if (activeIndex < 0) {
-                 activeIndex = sortedTracks.findIndex(t => t.url || t.wavUrl);
-               }
-               if (activeIndex < 0) activeIndex = 0;
-
-               setTracks(sortedTracks);
-               setAudioUrl(sortedTracks[activeIndex]?.url || statusData.audioUrl);
-               setSongTitle(typeof (statusData as Record<string, unknown>).title === 'string' ? ((statusData as Record<string, unknown>).title as string) : null);
-               setActiveTrackIndex(activeIndex);
+              setTracks(sortedTracks);
+              setAudioUrl(sortedTracks[activeIndex]?.url || statusData.audioUrl);
+              setSongTitle(typeof statusData.title === 'string' ? statusData.title : null);
+              setActiveTrackIndex(activeIndex);
               setStatus('completed');
               setProgress(100);
               setProcessingMessage('');
               setIsPlaying(false);
               setCurrentTime(0);
               setTrackDuration(0);
-
-              // Mark generation as complete to ignore subsequent SSE errors
               generationCompleteRef.current = true;
 
-               fetch('/api/credits')
-                 .then((r) => r.json())
-                 .then((d) => {
-                   if (d.credits != null) {
-                     setCredits(d.credits);
-                     setCreditsLoadFailed(false);
-                   }
-                 })
-                 .catch((err) => {
-                   // Silent failure acceptable — credits update is non-critical
-                   if (process.env.NODE_ENV === 'development') {
-                     console.debug('Credits refresh failed (non-critical):', err);
-                   }
-                 });
+              // Refresh credits — use Authorization header
+              const creditsHeaders: HeadersInit = userApiKey
+                ? { Authorization: `Bearer ${userApiKey}` }
+                : {};
+              fetch('/api/credits', { headers: creditsHeaders })
+                .then((r) => r.json())
+                .then((d) => {
+                  if (d.credits != null) {
+                    setCredits(d.credits);
+                    setCreditsLoadFailed(false);
+                  }
+                })
+                .catch(() => {
+                  if (process.env.NODE_ENV === 'development') {
+                    console.debug('Credits refresh failed (non-critical)');
+                  }
+                });
 
               saveToHistory({
                 id: Date.now().toString(),
@@ -659,102 +625,79 @@ export default function Home() {
                 prompt,
                 musicStyle,
                 makeInstrumental,
-                title: typeof (statusData as Record<string, unknown>).title === 'string' ? ((statusData as Record<string, unknown>).title as string) : null,
+                title: typeof statusData.title === 'string' ? statusData.title : null,
                 tracks: allTracks,
                 createdAt: Date.now(),
               });
 
               setRetryCount(0);
 
-              // Offer upgrade to full quality if this was a preview
-               if (isPreview && outputLength === DURATION_15S && status !== 'error') {
-                setIsPreview(false);
+              // Use ref to avoid stale closure on isPreview
+              if (isPreviewRef.current && outputLength === DURATION_15S) {
+                isPreviewRef.current = false;
                 setUpgradeAvailable(true);
               }
 
-              try {
-                es.close();
-              } catch {}
+              try { es.close(); } catch {}
             } else if (statusData.status === 'failed') {
               clearInterval(sseTimer);
               clearPoll();
-              const errMsg = typeof (statusData as Record<string, unknown>).error === 'string' ? ((statusData as Record<string, unknown>).error as string) : 'Generation failed';
-              setShowErrorBanner(true);
-              setError(errMsg);
+              const errMsg = typeof statusData.error === 'string' ? statusData.error : 'Generation failed';
+              setAppError({ title: 'Generation Failed', details: errMsg });
               setStatus('error');
-              try {
-                es.close();
-              } catch {}
+              try { es.close(); } catch {}
             } else {
-              // Processing
-               const msg = statusData.message || MESSAGE_PROCESSING_DEFAULT;
+              const msg = statusData.message || MESSAGE_PROCESSING_DEFAULT;
               setProcessingMessage(String(msg));
-
-
-                setPollAttempts((prev) => {
-                 const newAttempts = prev + 1;
-                 const p = Math.min(MAX_PROGRESS_PERCENT, newAttempts * 5);
-                 setProgress(p);
-                 return newAttempts;
-               });
+              setPollAttempts((prev) => {
+                const newAttempts = prev + 1;
+                setProgress(Math.min(MAX_PROGRESS_PERCENT, newAttempts * 5));
+                return newAttempts;
+              });
             }
           } catch {
             // Ignore malformed events
           }
-
         };
 
         const onError = () => {
-          // If generation already completed successfully, ignore this error
-          // (EventSource fires onerror when connection closes after we call close())
-          if (generationCompleteRef.current) {
-            return;
-          }
-
+          if (generationCompleteRef.current) return;
           clearInterval(sseTimer);
           clearPoll();
-          setShowErrorBanner(true);
-          setError('Failed to stream status updates');
+          setAppError({ title: 'Stream Error', details: 'Failed to stream status updates. Please try again.' });
           setStatus('error');
-          try {
-            es.close();
-          } catch {}
+          try { es.close(); } catch {}
         };
 
         es.addEventListener('message', onMessage as (ev: MessageEvent) => void);
-
         es.onerror = onError;
-
-        // No-op: EventSource will keep until close.
       } catch (e) {
         clearPoll();
-        setShowErrorBanner(true);
-        setError(e instanceof Error ? e.message : 'Streaming error');
+        setAppError({ title: 'Streaming Error', details: e instanceof Error ? e.message : 'Streaming error' });
         setStatus('error');
       }
 
     } catch (err) {
       clearPoll();
-      setShowErrorBanner(true);
-      setError(err instanceof Error ? err.message : 'Error starting generation');
+      setAppError({ title: 'Error', details: err instanceof Error ? err.message : 'Error starting generation' });
       setStatus('error');
     }
-   }, [prompt, musicStyle, makeInstrumental, numOutputs, outputLength, userApiKey, status, isPreview, clearPoll, saveToHistory, setUpgradeAvailable]);
+  }, [prompt, musicStyle, makeInstrumental, numOutputs, outputLength, userApiKey, clearPoll, saveToHistory]);
 
   const handleCancel = useCallback(() => {
     clearPoll();
     setStatus('idle');
-    setError('Cancelled');
     setProgress(0);
     setProcessingMessage('');
     setIsPlaying(false);
-    if (errorTimeoutRef.current) {
-      clearTimeout(errorTimeoutRef.current);
-    }
-     errorTimeoutRef.current = window.setTimeout(() => {
-       setError(null);
-       errorTimeoutRef.current = null;
-     }, ERROR_CLEAR_DELAY_MS);
+    if (errorTimeoutRef.current) clearTimeout(errorTimeoutRef.current);
+    // Show "Cancelled" briefly then clear
+    setAppError({ title: 'Cancelled', details: 'Generation was cancelled.' });
+    errorTimeoutRef.current = window.setTimeout(() => {
+      setAppError(null);
+      setStatus('idle');
+      errorTimeoutRef.current = null;
+    }, ERROR_CLEAR_DELAY_MS);
   }, [clearPoll]);
 
   const handleReset = useCallback(() => {
@@ -763,15 +706,13 @@ export default function Home() {
     setAudioUrl(null);
     setTaskId(null);
     setProgress(0);
-    setError(null);
-    setErrorDetails(null);
-    setShowErrorBanner(false);
+    setAppError(null);
     setSongTitle(null);
     setEta(null);
     setProcessingMessage('');
-     setTracks([]);
-     setActiveTrackIndex(-1);
-     setIsPlaying(false);
+    setTracks([]);
+    setActiveTrackIndex(-1);
+    setIsPlaying(false);
     setCurrentTime(0);
     setTrackDuration(0);
     setShouldRefreshAudioKey((v) => !v);
@@ -780,17 +721,7 @@ export default function Home() {
    const handleHistorySelect = useCallback((entry: HistoryEntry) => {
      clearPoll();
      setShowHistory(false);
-     const sortedHistoryTracks = [...entry.tracks].sort((a, b) => {
-       if (a.version === b.version) return 0;
-       if (a.version === 'v1') return -1;
-       if (a.version === 'v2') return 1;
-       return 0;
-     });
-     let historyActiveIndex = sortedHistoryTracks.findIndex(t => t.version === 'v2' && (t.url || t.wavUrl));
-     if (historyActiveIndex < 0) {
-       historyActiveIndex = sortedHistoryTracks.findIndex(t => t.url || t.wavUrl);
-     }
-     if (historyActiveIndex < 0) historyActiveIndex = 0;
+     const { sorted: sortedHistoryTracks, activeIndex: historyActiveIndex } = sortTracksAndPickActive(entry.tracks);
      setActiveTrackIndex(historyActiveIndex);
      setTracks(sortedHistoryTracks);
      setAudioUrl(sortedHistoryTracks[historyActiveIndex]?.url || null);
@@ -814,11 +745,13 @@ export default function Home() {
         return;
       }
 
-      // Prefer URL, fall back to WAV URL if available
-      const selectedUrl = (track as Track).url || (track as Track).wavUrl;
+      const selectedUrl = track.url || track.wavUrl;
       if (!selectedUrl) {
-        console.warn(`Track ${index} has no playable URL`, track);
-        return; // Guard: ignore clicks on unavailable tracks
+        // Don’t hard-block clicking if the tab is rendered but the URL
+        // hasn’t propagated yet; allow the UI to wait for the stream update.
+        console.warn(`Track ${index} has no playable URL yet`, track);
+        setAppError(null);
+        return;
       }
 
       setActiveTrackIndex(index);
@@ -827,14 +760,10 @@ export default function Home() {
       setAudioUrl(selectedUrl);
       setShouldRefreshAudioKey((v) => !v);
       // Clear any errors when switching tracks successfully
-      setError(null);
-      setErrorDetails(null);
-      setShowErrorBanner(false);
+      setAppError(null);
     } catch (error) {
       console.error('Error selecting track:', error);
-      setError('Failed to select track');
-      setErrorDetails('An unexpected error occurred while selecting the track.');
-      setShowErrorBanner(true);
+      setAppError({ title: 'Track Error', details: 'An unexpected error occurred while selecting the track.' });
     }
   }, []);
 
@@ -892,8 +821,7 @@ export default function Home() {
       const playPromise = audioRef.current.play();
       if (playPromise !== undefined) {
         playPromise.then(() => setIsPlaying(true)).catch(() => {
-          setError('Audio playback failed to start');
-          setShowErrorBanner(true);
+          setAppError({ title: 'Playback Error', details: 'Audio playback failed to start.' });
         });
       }
     } else {
@@ -912,7 +840,14 @@ export default function Home() {
    // Keyboard shortcuts - placed after all handlers are defined
    useEffect(() => {
      const handleKeyDown = (e: KeyboardEvent) => {
-       if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) {
+       const target = e.target as HTMLElement | null;
+       const isFormElement =
+         target instanceof HTMLTextAreaElement ||
+         target instanceof HTMLInputElement ||
+         target instanceof HTMLSelectElement ||
+         (target?.isContentEditable ?? false);
+
+       if (isFormElement) {
          if (e.key === 'Escape') {
            e.preventDefault();
            if (status === 'polling' || status === 'generating') {
@@ -932,6 +867,7 @@ export default function Home() {
            }
            break;
          case ' ':
+           // Only trigger global play/pause when audio is ready and we're not in any focusable element
            if (audioUrl && status === 'completed') {
              e.preventDefault();
              togglePlayPause();
@@ -971,8 +907,10 @@ export default function Home() {
            <div className="text-right">
              <button
                onClick={() => {
-                 const url = userApiKey ? `/api/credits?userApiKey=${encodeURIComponent(userApiKey)}` : '/api/credits';
-                 fetch(url)
+                 const headers: HeadersInit = userApiKey
+                   ? { Authorization: `Bearer ${userApiKey}` }
+                   : {};
+                 fetch('/api/credits', { headers })
                    .then((r) => r.json())
                    .then((d) => {
                      if (d.credits != null) {
@@ -1082,8 +1020,12 @@ export default function Home() {
                )}
 
         {/* Error Banner - Enhanced */}
-        {showErrorBanner && errorDetails && (
-          <div className="relative overflow-hidden rounded-xl border border-red-800/50 bg-gradient-to-r from-red-950/80 via-red-900/60 to-rose-900/80 p-5 shadow-lg animate-slideInUp">
+        {appError && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="relative overflow-hidden rounded-xl border border-red-800/50 bg-gradient-to-r from-red-950/80 via-red-900/60 to-rose-900/80 p-5 shadow-lg animate-slideInUp"
+          >
             {/* Decorative glow */}
             <div className="absolute inset-0 bg-gradient-to-r from-red-500/5 via-transparent to-rose-500/5 pointer-events-none" />
             
@@ -1095,8 +1037,8 @@ export default function Home() {
               </div>
               
               <div className="flex-1 min-w-0">
-                <h3 className="text-sm font-semibold text-red-200 mb-1">Generation Failed</h3>
-                <p className="text-sm text-red-100/90 break-words leading-relaxed">{errorDetails}</p>
+                <h3 className="text-sm font-semibold text-red-200 mb-1">{appError.title}</h3>
+                <p className="text-sm text-red-100/90 break-words leading-relaxed">{appError.details}</p>
                 
                 {retryCount > 0 && (
                   <p className="text-xs text-red-300/70 mt-2">
@@ -1109,9 +1051,7 @@ export default function Home() {
                 {status === 'error' && prompt.trim() && (
                   <button
                     onClick={() => {
-                      setShowErrorBanner(false);
-                      setErrorDetails(null);
-                      setError(null);
+                      setAppError(null);
                       handleGenerate(true);
                     }}
                     className="flex-1 sm:flex-none inline-flex items-center justify-center gap-2 px-4 py-2 bg-red-600/80 hover:bg-red-500 border border-red-500/50 rounded-lg text-sm font-medium text-white transition-all hover:scale-105 active:scale-95 shadow-lg shadow-red-900/50"
@@ -1125,9 +1065,7 @@ export default function Home() {
 
                 <button
                   onClick={() => {
-                    setShowErrorBanner(false);
-                    setErrorDetails(null);
-                    setError(null);
+                    setAppError(null);
                   }}
                   className="flex-1 sm:flex-none w-10 h-10 sm:w-auto sm:px-4 rounded-lg bg-red-900/30 hover:bg-red-800/50 border border-red-700/30 flex items-center justify-center transition-colors"
                   aria-label="Dismiss error"
@@ -1335,18 +1273,25 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Error Message */}
-          {!showErrorBanner && error && (
-            <div className="p-4 bg-red-900/30 border border-red-800 rounded-xl">
-              <p className="text-red-400 text-sm">{error}</p>
-            </div>
-          )}
+          {/* (Inline error block removed — appError banner handles all error display) */}
 
            {/* Action Row */}
            <div className="flex gap-3">
                 <button
-                  onClick={() => status === 'error' ? handleReset() : status === 'polling' ? handleCancel() : handleGenerate()}
-                  disabled={status === 'generating' || (!prompt.trim() && status === 'idle') || (status !== 'polling' && !userApiKey && serverKeyConfigured !== true)}
+                  onClick={() => {
+                    if (status === 'error') { handleReset(); return; }
+                    if (status === 'polling') { handleCancel(); return; }
+                    // If no API key available, show a helpful error instead of being silently disabled
+                    if (!userApiKey && serverKeyConfigured !== true) {
+                      setAppError({
+                        title: 'API Key Required',
+                        details: 'Please enter your MusicGPT API key below to generate music.',
+                      });
+                      return;
+                    }
+                    handleGenerate();
+                  }}
+                  disabled={status === 'generating' || (!prompt.trim() && status === 'idle')}
                  className={`
                   relative flex-1 py-4 rounded-xl font-semibold text-lg transition-all duration-200
                   ${status === 'generating'
@@ -1408,7 +1353,12 @@ export default function Home() {
 
           {/* Progress Bar - Enhanced */}
           {status === 'polling' && (
-            <div className="space-y-4 bg-gray-800/30 border border-gray-700/50 rounded-xl p-4">
+            <div
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className="space-y-4 bg-gray-800/30 border border-gray-700/50 rounded-xl p-4"
+            >
               <div className="space-y-2">
                 {/* Progress Percentage */}
                 <div className="flex items-center justify-between">
@@ -1479,7 +1429,8 @@ export default function Home() {
                             e.stopPropagation();
                             handleTrackSelect(i, track);
                           }}
-                          disabled={!track.url && !track.wavUrl}
+                          disabled={false}
+                          data-track-version={version}
                           className={`
                             relative flex-shrink-0 py-2 px-4 rounded-lg text-sm font-medium transition-all min-w-[100px]
                             ${isActive
@@ -1575,8 +1526,7 @@ export default function Home() {
                    onPause={() => setIsPlaying(false)}
                    onError={() => {
                      console.error('Audio load error for URL:', audioUrl);
-                     setError('Failed to load audio. The file may be unavailable or CORS-restricted.');
-                     setShowErrorBanner(true);
+                     setAppError({ title: 'Audio Error', details: 'Failed to load audio. The file may be unavailable or CORS-restricted.' });
                    }}
                  />
 
@@ -1667,6 +1617,7 @@ export default function Home() {
                       ref={visualizationRef}
                       width={300}
                       height={100}
+                      aria-hidden="true"
                       className="w-full h-full rounded filter drop-shadow-lg"
                     />
                   </div>

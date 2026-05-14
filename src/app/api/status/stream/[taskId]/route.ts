@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { mapConversionToTracks, buildFailed } from '@/lib/trackUtils';
 import { MUSICGPT_CONFIG, CONVERSION_TYPE } from '@/lib/config';
+import { fetchWithRetry, isNetworkError } from '@/lib/fetchWithRetry';
 import {
   FETCH_RETRY_ATTEMPTS,
   FETCH_RETRY_BACKOFF_MS,
   STREAM_FETCH_TIMEOUT_MS,
   POLL_INTERVAL_MS,
+  MAX_POLL_ATTEMPTS,
   MESSAGE_PROCESSING_DEFAULT,
   ERROR_API_KEY_MISSING,
   ERROR_API_KEY_INVALID,
@@ -15,37 +17,27 @@ import {
 
 const MUSICGPT_STATUS_URL = `${MUSICGPT_CONFIG.BASE_URL}${MUSICGPT_CONFIG.STATUS_PATH}`;
 
-async function fetchWithRetry(url: string, options: RequestInit, retries = FETCH_RETRY_ATTEMPTS, backoff = FETCH_RETRY_BACKOFF_MS) {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), STREAM_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { ...options, signal: controller.signal });
-      clearTimeout(timeout);
-      return resp;
-    } catch (err) {
-      lastError = err;
-      if (attempt < retries) {
-        await new Promise((r) => setTimeout(r, backoff * Math.pow(2, attempt)));
-      }
-    }
-  }
-  throw lastError;
-}
+// Server-side max stream duration — prevents runaway polling if client never disconnects
+const MAX_STREAM_DURATION_MS = MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS;
 
 async function fetchStatusWithKey(apiKey: string, taskId: string) {
   const url = new URL(MUSICGPT_STATUS_URL);
   url.searchParams.set('conversionType', CONVERSION_TYPE);
   url.searchParams.set('task_id', taskId);
 
-  const response = await fetchWithRetry(url.toString(), {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
+  const response = await fetchWithRetry(
+    url.toString(),
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
     },
-  });
+    FETCH_RETRY_ATTEMPTS,
+    FETCH_RETRY_BACKOFF_MS,
+    STREAM_FETCH_TIMEOUT_MS
+  );
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
@@ -64,8 +56,6 @@ async function fetchStatusWithKey(apiKey: string, taskId: string) {
   return await response.json();
 }
 
-
-
 function formatSseMessage(payload: unknown, event = 'message') {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
 }
@@ -75,12 +65,16 @@ export async function GET(
   { params }: { params: Promise<{ taskId: string }> }
 ) {
   const { taskId } = await params;
-  const { searchParams } = new URL(request.url);
-  const userApiKey = searchParams.get('userApiKey')?.trim() || undefined;
 
   if (!taskId) {
     return NextResponse.json({ error: 'Task ID is required' }, { status: 400 });
   }
+
+  // Prefer Authorization header; fall back to query param for backward compat.
+  const authHeader = request.headers.get('authorization');
+  const headerKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+  const queryKey = new URL(request.url).searchParams.get('userApiKey')?.trim() ?? null;
+  const userApiKey = headerKey || queryKey || undefined;
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -96,17 +90,24 @@ export async function GET(
       send({ status: 'processing', progress: 0, message: 'Starting stream...' });
 
       const abort = new AbortController();
-      const intervalMs = POLL_INTERVAL_MS;
 
-      // When client disconnects, abort our polling
+      // Abort when client disconnects
       const onRequestAbort = () => abort.abort();
       request.signal.addEventListener('abort', onRequestAbort);
-      if (request.signal.aborted) {
-        abort.abort();
-      }
+      if (request.signal.aborted) abort.abort();
+
+      // Server-side timeout — abort after max duration regardless of client
+      const serverTimeout = setTimeout(() => {
+        if (!abort.signal.aborted) {
+          send({ status: 'failed', progress: 0, error: 'Generation timed out on server.' });
+          try { controller.close(); } catch {}
+          abort.abort();
+        }
+      }, MAX_STREAM_DURATION_MS);
 
       const sendFinalAndClose = (data: unknown) => {
         send(data);
+        clearTimeout(serverTimeout);
         try { controller.close(); } catch {}
         abort.abort();
       };
@@ -117,7 +118,9 @@ export async function GET(
             const data = await fetchStatusWithKey(userApiKey, taskId);
 
             if (!data?.success) {
-              sendFinalAndClose(buildFailed(data?.message || data?.error || ERROR_GENERATION_FAILED));
+              sendFinalAndClose(
+                buildFailed(data?.message || data?.error || ERROR_GENERATION_FAILED)
+              );
               return;
             }
 
@@ -128,10 +131,15 @@ export async function GET(
             }
 
             const currentStatus = conversion.status || 'PROCESSING';
-            const tracks = mapConversionToTracks(conversion);
-            const audioUrl = tracks[0]?.url || null;
+            const allTracks = mapConversionToTracks(conversion);
+            const playableTracks = allTracks.filter((t) => t?.url || t?.wavUrl);
+            const playableCount = playableTracks.length;
+            const audioUrl = playableTracks[0]?.url || playableTracks[0]?.wavUrl || null;
 
-            const isCompleted = currentStatus === 'COMPLETED' || !!audioUrl;
+            // Only mark complete when MusicGPT explicitly says COMPLETED,
+            // or when BOTH variants (v1 + v2) are playable.
+            const isCompleted = currentStatus === 'COMPLETED' || playableCount >= 2;
+
             const isFailed = currentStatus === 'FAILED' || currentStatus === 'ERROR';
 
             if (isCompleted) {
@@ -139,9 +147,13 @@ export async function GET(
                 status: 'completed',
                 progress: 100,
                 audioUrl,
-                title: tracks[0]?.title || conversion.title_1 || conversion.title_2 || null,
+                title:
+                  playableTracks[0]?.title ||
+                  conversion.title_1 ||
+                  conversion.title_2 ||
+                  null,
                 music_style: conversion.music_style || null,
-                tracks,
+                tracks: playableTracks,
               });
               return;
             }
@@ -159,21 +171,13 @@ export async function GET(
             return;
           }
 
-          sendFinalAndClose({
-            status: 'failed',
-            progress: 0,
-            error: ERROR_API_KEY_MISSING,
-          });
+          sendFinalAndClose({ status: 'failed', progress: 0, error: ERROR_API_KEY_MISSING });
         } catch (error: unknown) {
           const err = error as { status?: number; message?: string; retryAfter?: number };
           const status = err?.status || 500;
 
           if (status === 401) {
-            sendFinalAndClose({
-              status: 'failed',
-              progress: 0,
-              error: ERROR_API_KEY_INVALID,
-            });
+            sendFinalAndClose({ status: 'failed', progress: 0, error: ERROR_API_KEY_INVALID });
             return;
           }
 
@@ -181,39 +185,38 @@ export async function GET(
             sendFinalAndClose({
               status: 'failed',
               progress: 0,
-              error: `MusicGPT rate limit: ${err?.message || 'Too many requests'}.${err?.retryAfter ? ` Try again in ${err.retryAfter}s.` : ''}`,
+              error: `MusicGPT rate limit: ${err?.message || 'Too many requests'}.${
+                err?.retryAfter ? ` Try again in ${err.retryAfter}s.` : ''
+              }`,
             });
             return;
           }
 
           const message = err?.message || 'Internal server error';
-          const isNetworkError = message.includes('fetch failed') || message.includes('ETIMEDOUT') || message.includes('ECONNREFUSED') || message.includes('ENOTFOUND') || message.includes('ConnectTimeoutError');
           sendFinalAndClose({
-            error: isNetworkError ? ERROR_NETWORK : message
+            error: isNetworkError(message) ? ERROR_NETWORK : message,
           });
         }
       };
 
-      // Perform first poll
+      // First poll immediately
       await pollOnce();
 
-      // If already aborted (e.g., client disconnected), do not set up interval
       if (abort.signal.aborted) {
-        // Ensure listener removed to avoid leaks
+        clearTimeout(serverTimeout);
         request.signal.removeEventListener('abort', onRequestAbort);
         return;
       }
 
-      // Set up polling interval
+      // Polling interval
       const timer = setInterval(() => {
         if (abort.signal.aborted) return;
         pollOnce();
-      }, intervalMs);
+      }, POLL_INTERVAL_MS);
 
-      // Clear interval when abort signal fires
       abort.signal.addEventListener('abort', () => {
         clearInterval(timer);
-        // Also clean up the request abort listener
+        clearTimeout(serverTimeout);
         request.signal.removeEventListener('abort', onRequestAbort);
       });
     },
@@ -224,7 +227,6 @@ export async function GET(
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
     },
   });
 }

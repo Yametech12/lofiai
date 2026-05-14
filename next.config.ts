@@ -15,13 +15,16 @@ const nextConfig: NextConfig = {
       },
     ],
   },
-  // Allow audio from MusicGPT S3 and external sources
   async headers() {
+    const origin = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     return [
       {
+        // Restrict CORS to the app's own origin instead of wildcard
         source: '/api/:path*',
         headers: [
-          { key: 'Access-Control-Allow-Origin', value: '*' },
+          { key: 'Access-Control-Allow-Origin', value: origin },
+          { key: 'Access-Control-Allow-Methods', value: 'GET, POST, OPTIONS' },
+          { key: 'Access-Control-Allow-Headers', value: 'Content-Type, Authorization' },
         ],
       },
     ];
